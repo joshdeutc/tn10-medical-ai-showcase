@@ -1,0 +1,281 @@
+---
+title: "The paragraph, a universal unit"
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+import sys
+sys.path.insert(0, ".")
+import statistics
+import pandas as pd
+from _outils import *          # noqa: F403
+PARA = PARAGRAPHES
+```
+
+*Code covered: `tools/traduire_paragraphes.py`.*
+
+Splitting a document before translating it is not an implementation detail: it is the
+decision that determines whether the translation will be complete or cut short, and by
+how much. This chapter explains the splitting that was kept — **one single assumption
+about the document, and nothing else** — and the two strategies that were measured and
+discarded before getting there.
+
+An earlier version of the pipeline split notes by exploiting the exact structure of
+MIMIC: a section-header pattern, a frozen translation table for the titles, detection
+of laboratory blocks. It produced very good Croatian on this corpus and was
+transferable nowhere. It was withdrawn in favour of the splitting described here; what
+it taught is in the appendix.
+
+## The minimal assumption
+
+```{python}
+#| echo: false
+#| output: asis
+montre("paragraphs", ou=PARA)
+```
+
+A paragraph is a run of non-empty lines. That is all. No initial capital, no trailing
+colon, no laboratory pattern, no translation table. The only thing assumed of a
+document is that it contains blank lines — which is true of a MIMIC discharge summary,
+of a paper, of a report, of a letter.
+
+```{python}
+#| echo: false
+#| output: asis
+montre("split", "sentences", ou=PARA)
+```
+
+`sentences()` only fires on paragraphs above the ceiling, and never cuts in the middle
+of a sentence: a truncated sentence yields a **wrong** translation, not merely an
+incomplete one.
+
+What the splitting does **not** know, and that is the point:
+
+| | old splitting, withdrawn | `traduire_paragraphes.py` |
+|---|---|---|
+| section-header pattern | regex specific to MIMIC | — |
+| translation table for titles | 52 frozen entries | — |
+| laboratory-block detector | yes | — |
+| line-classification rule | 4 tests | — |
+| translation direction | hard-coded EN -> HR | `--src` / `--tgt` |
+| assumption about the document | full MIMIC structure | **blank lines** |
+
+## Why the paragraph, and not something else
+
+The answer is not aesthetic, it is measured. The paragraph is the only unit that
+**survives translation**.
+
+```{python}
+#| echo: false
+#| output: asis
+paragraphs = fonction("paragraphs", PARA)
+src = pd.read_excel(RACINE / "CATH-LLM" / "exampleNotes_250.xlsx")[["id_note", "input"]]
+hr = pd.read_csv(RACINE / "results" / "notes_croate_milmmt-12b.csv")[["id_note", "input"]]
+
+lignes = []
+for nom, d in [("English source", src), ("Croatian (MiLMMT)", hr)]:
+    tailles, par_note = [], []
+    for r in d.itertuples():
+        p = paragraphs(r.input)
+        par_note.append(len(p))
+        tailles += [len(x) for x in p]
+    lignes.append({"corpus": nom, "paragraphs": len(tailles),
+                   "per note (median)": int(statistics.median(par_note)),
+                   "median size": f"{statistics.median(tailles):.0f} chars",
+                   "> 1000 chars": f"{sum(1 for t in tailles if t > 1000) / len(tailles):.1%}"})
+tableau(lignes)
+```
+
+The paragraph count is **identical on both sides**. Croatian is 13 % longer in
+characters — normal behaviour for the language — but it has exactly the same number of
+paragraphs. Nothing in the pipeline imposed that: the blank lines are copied through as
+they are, so the structure of the document crosses the translation on its own.
+
+::: {.callout-note}
+The Croatian side read here is `notes_croate_milmmt-12b.csv`, one call per paragraph.
+The corpus this script produces has slightly *more* paragraphs than its input (10 471
+against 10 031), because a paragraph above the character ceiling is cut into sentences
+and each piece is re-joined as a paragraph of its own. The one-to-one correspondence
+holds for the translation itself, not for the split/re-join round trip.
+:::
+
+A unit that is stable in both languages is what makes the splitting reversible. Neither
+the line nor the sentence has that property: the line because MIMIC wraps arbitrarily
+at 80 columns, the sentence because punctuation moves in translation.
+
+## The mistake that cost a run: aiming at the context window {#sec-biais-longueur}
+
+The natural intuition is to fill each call as much as possible: fewer calls, more
+context, better translation. It is wrong, and the measurement is unambiguous.
+
+```{python}
+#| echo: false
+#| output: asis
+tableau([
+    {"strategy": "whole note (1 call)", "call size": "~10,000 chars",
+     "content lost": "~40 % of every note, systematically"},
+    {"strategy": "filling up to 3000 chars", "call size": "3,000 chars",
+     "content lost": "14 % of notes cut short, 13 % of redactions lost"},
+    {"strategy": "one paragraph per call", "call size": "118 chars (median)",
+     "content lost": "0 notes cut short, 2.6 % of redactions"},
+])
+```
+
+### The mechanism
+
+A translation model does not "process" a text to get the translation out. It predicts
+one token at a time, and at each step it may also predict the end-of-sequence token.
+**As soon as it predicts that token, generation stops and the rest of the input is
+ignored.** No exception, no warning: the caller receives an answer it believes to be
+complete.
+
+Observed on a whole note: 713 tokens produced where 1,985 were allowed. The model was
+not hitting a ceiling, it had stopped on its own, having translated as far as the
+imaging results. The rest of the note — tijek hospitalizacije, upute pri otpustu — did
+not exist in the output.
+
+The clearest trace runs through the numbers, which a translator has to copy through
+unchanged:
+
+```
+note 16292028-DS-14, split into 4 calls of 3000 characters
+  call 1 (2752 chars) :  8/10 numeric values recovered
+  call 2 (2987 chars) :  5/32 values recovered   <- stopped mid-piece
+  call 3 (2743 chars) :  0/2  values recovered   <- nothing at all
+```
+
+### It is not the context window
+
+The Gemma 3 architecture under MiLMMT accepts 131,072 tokens. A 10,000-character note
+fits in it thirty times over. What bounds the useful input is therefore not the window,
+it is the **length distribution of the training data**: these models are trained on
+sentence pairs, so their comfort zone is a few hundred tokens wide.
+
+The phenomenon is documented under the name **length bias** in document-level
+translation. The wording in the literature describes the observation exactly: the
+sequence stops when the end token is generated, and if the model overestimates that
+token's probability, *it ignores the rest of the input and produces a truncated
+translation*.
+
+::: {.callout-important}
+## Size the call on the training length, not on the window
+
+This is the rule to take away from this chapter. The context window a model advertises
+says what it can **read**, not what it can **translate in one go**. The two figures are
+unrelated, and only the second matters for sizing a split.
+:::
+
+## The length ratio is blind to the worst failure
+
+While looking for a model able to handle a whole document, Gemma 3 27B produced outputs
+with ratios of 0.997 and 0.995 — apparently perfect. In reality **it was copying the
+Croatian** without translating: out of 31 lines of content, 24 had stayed Croatian, 1
+was English.
+
+A copy has a ratio of 1.00. A length check therefore cannot distinguish it from a
+faithful translation. A second, lexical check is needed:
+
+```{python}
+import re
+CROATIAN = re.compile(r"[čćžšđ]|\b(je|su|nije|koji|nakon|prije|vam|ste|zbog|nema)\b", re.I)
+ENGLISH = re.compile(r"\b(the|was|were|and|with|patient|had|for|from|discharge)\b", re.I)
+
+for label, text in [
+    ("untranslated copy", "Bolesnik je primljen nakon prometne nesreće, bez komplikacija."),
+    ("real translation ", "The patient was admitted after a traffic accident, with no complications."),
+]:
+    print(f"  {label} : croatian={bool(CROATIAN.search(text))} "
+          f"english={bool(ENGLISH.search(text))}")
+```
+
+Two lessons: a metric of quantity does not replace a metric of nature, and an indicator
+that cannot fail measures nothing.
+
+## Sizing for the target machine
+
+The intended production machine is an **A100 40 GB**. MiLMMT in bf16 weighs 24 GB, so
+16 GB are left for the KV cache and the activations — which is what bounds the batch
+size.
+
+```{python}
+#| echo: false
+#| output: asis
+montre("plan_vram", ou=PARA)
+```
+
+The function runs **before** the model is loaded, and it rejected a first setting
+straight away:
+
+```
+expected VRAM: weights 24 GB + KV cache 11.6 GB (32 x 920 tokens) = ~41 GB / 40 GB target
+  WARNING: exceeds the target. Reduce --batch to ~31 or pass --four-bit
+```
+
+### The KV cache, term by term {#sec-cache-kv}
+
+The item people forget is the KV cache, and it is worth writing out in full, because
+the shape of the formula is the whole argument:
+
+```
+KV cache = 2 (K and V) × layers × kv_heads × head_dim × length × batch × 2 bytes
+         = 2 × 48 × 8 × 256 × 920 × 24 × 2
+         = 8.7 GB
+```
+
+Every factor but the last two is fixed by the architecture: MiLMMT-46-12B has 48
+layers, 8 key-value heads and a head dimension of 256. That leaves **0.39 MB of cache
+per token**, and two levers, both strictly linear: **the sequence length** and **the
+batch size**. Double either one and the cache doubles.
+
+Two consequences follow, and they are the reason this section exists:
+
+- the cache stays in **bf16 even when the weights are quantised**. Quantisation applies
+  to the weights, not to the cached activations — a 4-bit model drops from 24 GB to
+  7 GB of weights while keeping a full-size cache. At batch 64 the cache reaches
+  23.2 GB, more than three times the weights;
+- **`--max-chars` is not the knob to turn when VRAM is tight.** The 1000-character
+  ceiling exists to protect the translation (see @sec-biais-longueur), not the memory,
+  and 95 % of calls never come near it — the median call is 118 characters. The knob
+  that actually moves the cache is `--batch`, which is precisely what `plan_vram`
+  suggests reducing.
+
+Two settings that are valid on 40 GB:
+
+| | weights | batch | KV cache | total |
+|---|---|---|---|---|
+| bf16 | 24 GB | 24 | 8.7 GB | ~38 GB |
+| 4-bit | 7 GB | 64 | 23.2 GB | ~35 GB, slower per token |
+
+::: {.callout-warning}
+The 15 % activation margin is an estimate, not a measurement. On the real run one GPU
+climbed to 41.4 GB where the function announced 38 — the gap is entirely down to that
+flat margin. On an A100 40 GB the batch therefore has to come down, or the run has to
+go 4-bit. The estimate stays useful for eliminating absurd settings; it does not
+replace the measured peak.
+:::
+
+## More faithful, and faster
+
+Splitting by paragraph is **both more faithful and faster** than filling up to 3,000
+characters. Faster may be surprising: a batch of 24 short paragraphs saturates the GPU
+better than a batch of 4 long pieces, because a batch generates until its longest
+sequence finishes. Optimising the call size upwards therefore lost on both counts at
+once.
+
+## Takeaways
+
+- One single assumption — the document contains blank lines — is enough to split any
+  corpus. All the rest of the MIMIC machinery is optional.
+- The paragraph is the right unit because it is **stable under translation**: 10,031
+  paragraphs in English, 10,031 in the Croatian of `notes_croate_milmmt-12b.csv`.
+- Sizing a call on the context window is a category error. What counts is the length
+  seen during training.
+- A model that stops too early raises no error: it ignores the rest of the input. Only
+  an explicit check catches it.
+- The length ratio does not distinguish a translation from a copy. You have to measure
+  the **language** of the output, not only its size.
+- The KV cache is linear in sequence length and in batch size, and stays in bf16 even
+  with 4-bit weights. `--batch` is the lever; `--max-chars` protects the translation,
+  not the memory.
+- Filling calls to the maximum lost on fidelity *and* on speed.

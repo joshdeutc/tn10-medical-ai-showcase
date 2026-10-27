@@ -1,0 +1,312 @@
+---
+title: "ResNet18 — Entraînement sur mammographies RSNA"
+subtitle: "Visualisation du code et des résultats d'entraînement"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+jupyter: gmic
+---
+
+```{python}
+#| echo: false
+import os
+import sys
+import json
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import torch
+from sklearn.metrics import roc_curve, roc_auc_score
+
+warnings.filterwarnings("ignore")
+
+
+def _find_root(start: str) -> str:
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(cur, "fine_tuning")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return os.path.abspath(start)
+        cur = parent
+
+
+PROJECT_DIR = _find_root(os.getcwd())
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+CKPT_DIR   = Path(PROJECT_DIR) / "fine_tuning" / "checkpoints"
+LOGS_PATH  = CKPT_DIR / "resnet18_logs.json"
+CKPT_PATH  = CKPT_DIR / "resnet18_best.pt"
+ROC_PATH   = CKPT_DIR / "resnet18_roc.png"
+
+logs_ok = LOGS_PATH.exists()
+ckpt_ok = CKPT_PATH.exists()
+
+if logs_ok:
+    with open(LOGS_PATH) as f:
+        logs = json.load(f)
+    df = pd.DataFrame(logs["epochs"])
+    hp = logs["hyperparams"]
+else:
+    print("⚠️  Aucun log trouvé. Lance d'abord : python -m fine_tuning.train_resnet")
+```
+
+# Partie I — Le problème et les données
+
+## 1. Contexte : classification binaire de mammographies
+
+On entraîne un **ResNet18** à distinguer les mammographies saines des cancéreuses.
+
+Le dataset RSNA est fortement déséquilibré : seulement **~4 % de cas cancer**.
+Avec ~950 exams × 4 vues = ~3 800 images au total.
+
+```{python}
+#| echo: false
+if logs_ok:
+    print(f"Images train : {hp['n_train']}  (cancer={hp['n_cancer_train']})")
+    print(f"Images val   : {hp['n_val']}  (cancer={hp['n_cancer_val']})")
+    ratio = (hp['n_train'] - hp['n_cancer_train']) / max(hp['n_cancer_train'], 1)
+    print(f"Ratio sain/cancer (train) : {ratio:.1f}:1")
+```
+
+---
+
+# Partie II — Le code expliqué
+
+## 2. Le dataset : du PKL aux images
+
+Chaque exam dans le fichier `data.pkl` contient 4 vues (`L-CC`, `L-MLO`, `R-CC`, `R-MLO`).
+La fonction `_make_entries()` aplatit cette structure en une liste de paires `(chemin_image, label)`.
+
+```python
+# fine_tuning/train_resnet.py — _make_entries()
+def _make_entries(exam_list):
+    entries = []
+    for exam in exam_list:
+        label = int(exam["cancer_label"]["malignant"])   # 0 ou 1 au niveau exam
+        for view in ["L-CC", "L-MLO", "R-CC", "R-MLO"]:
+            for rel_path in exam.get(view, []):
+                p = IMAGE_DIR / (rel_path + ".png")
+                if p.exists():
+                    entries.append((p, label))           # chaque vue = un échantillon
+    return entries
+```
+
+> **Attention au leakage** : le split train/val est fait **au niveau exam** (via `load_and_split()`),
+> pas au niveau image. Sinon des vues du même patient se retrouveraient des deux côtés.
+
+## 3. Les transformations appliquées aux images
+
+```python
+# fine_tuning/train_resnet.py — ImageDataset
+transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),   # PNG gris → 3 canaux (ResNet attend RGB)
+    transforms.Resize(512),                         # redimension côté court à 512px
+    transforms.CenterCrop(512),                     # crop carré central
+    transforms.RandomHorizontalFlip(),              # augmentation (train uniquement)
+    transforms.RandomRotation(5),
+    transforms.ColorJitter(brightness=0.15, contrast=0.15),
+    transforms.ToTensor(),
+    transforms.Normalize(                           # normalisation ImageNet
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    ),
+])
+```
+
+> Les images sont déjà normalisées `[0, 255]` uint8 par le preprocessing.
+> La normalisation ImageNet ici les recentre pour coller aux statistiques sur lesquelles ResNet a été pré-entraîné.
+
+## 4. Gérer le déséquilibre : WeightedRandomSampler
+
+Avec 24 images saines pour 1 cancer, le modèle peut tricher en prédisant toujours "sain".
+Le `WeightedRandomSampler` force chaque batch à contenir **50 % cancer / 50 % sain**.
+
+```python
+# fine_tuning/train_resnet.py — _make_sampler()
+labels = [e[1] for e in entries]
+n_pos, n_neg = sum(labels), len(labels) - sum(labels)
+weights = [1/n_pos if l == 1 else 1/n_neg for l in labels]
+# → les images cancer sont tirées ~24× plus souvent que les saines
+sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+```
+
+## 5. L'architecture ResNet18
+
+```python
+# fine_tuning/train_resnet.py — build_resnet18()
+model = models.resnet18(weights=None)        # pas de pré-entraînement ImageNet
+model.fc = nn.Linear(512, 1)                 # remplace la tête 1000-classes par 1 logit
+```
+
+La sortie est **un seul logit** (pas de softmax). La loss `BCEWithLogitsLoss` applique
+la sigmoïde en interne, ce qui est plus stable numériquement.
+
+```
+Input  (B, 3, 512, 512)
+  ↓  conv1 + bn + relu + maxpool
+  ↓  layer1 (2× BasicBlock, 64 filtres)
+  ↓  layer2 (2× BasicBlock, 128 filtres)
+  ↓  layer3 (2× BasicBlock, 256 filtres)
+  ↓  layer4 (2× BasicBlock, 512 filtres)
+  ↓  avgpool global → (B, 512)
+  ↓  fc Linear(512 → 1)
+Output (B,)  — logit de malignité
+```
+
+## 6. La boucle d'entraînement
+
+```python
+optimizer = Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+loss_fn   = BCEWithLogitsLoss()
+```
+
+Le learning rate suit un **cosinus décroissant** : il part de `lr`, descend doucement
+vers 0 sur `T_max` epochs. Cela évite les oscillations en fin d'entraînement.
+
+---
+
+# Partie III — Résultats
+
+## 7. Hyperparamètres utilisés
+
+```{python}
+#| echo: false
+if logs_ok:
+    print(f"Epochs      : {hp['epochs']}")
+    print(f"Batch size  : {hp['batch_size']}")
+    print(f"Learning rate : {hp['lr']}")
+    print(f"Weight decay  : {hp['weight_decay']}")
+    print(f"Image size  : {hp['img_size']}×{hp['img_size']}")
+    print(f"Device      : {hp['device']}")
+```
+
+## 8. Courbes d'entraînement
+
+```{python}
+#| echo: false
+if not logs_ok:
+    print("Pas de logs disponibles.")
+else:
+    best_rows = df[df["is_best"] == True]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # — Loss train
+    axes[0].plot(df["epoch"], df["train_loss"], color="steelblue", lw=2, label="Train")
+    axes[0].set_title("Train Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("BCEWithLogitsLoss")
+    axes[0].grid(alpha=0.3)
+
+    # — Loss val
+    axes[1].plot(df["epoch"], df["val_loss"], color="tomato", lw=2, label="Val")
+    axes[1].set_title("Val Loss")
+    axes[1].set_xlabel("Epoch")
+    axes[1].grid(alpha=0.3)
+
+    # — AUC-ROC val
+    axes[2].plot(df["epoch"], df["auc"], color="seagreen", lw=2)
+    if not best_rows.empty:
+        axes[2].scatter(
+            best_rows["epoch"], best_rows["auc"],
+            color="gold", edgecolors="black", zorder=5, s=80, label="Meilleur"
+        )
+    axes[2].set_title("AUC-ROC (val)")
+    axes[2].set_xlabel("Epoch")
+    axes[2].set_ylim(0, 1)
+    axes[2].axhline(0.5, color="gray", linestyle="--", lw=1, label="Hasard")
+    axes[2].legend()
+    axes[2].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    best_epoch = best_rows.iloc[-1] if not best_rows.empty else None
+    if best_epoch is not None:
+        print(f"Meilleur epoch : {int(best_epoch['epoch'])}  "
+              f"| AUC = {best_epoch['auc']:.4f}  "
+              f"| val_loss = {best_epoch['val_loss']:.4f}")
+```
+
+## 9. Temps par epoch
+
+```{python}
+#| echo: false
+if logs_ok and "time_s" in df.columns:
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.bar(df["epoch"], df["time_s"], color="slategray", alpha=0.7)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Secondes")
+    ax.set_title("Temps par epoch (train)")
+    ax.axhline(df["time_s"].mean(), color="red", linestyle="--", lw=1,
+               label=f"Moyenne : {df['time_s'].mean():.0f}s")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+```
+
+## 10. Courbe ROC (meilleur epoch, val set)
+
+```{python}
+#| echo: false
+if ROC_PATH.exists():
+    img = mpimg.imread(str(ROC_PATH))
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.imshow(img)
+    ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+elif ckpt_ok:
+    ckpt = torch.load(str(CKPT_PATH), map_location="cpu")
+    if "val_preds" in ckpt and "val_targets" in ckpt:
+        preds   = ckpt["val_preds"]
+        targets = ckpt["val_targets"]
+        fpr, tpr, _ = roc_curve(targets, preds)
+        auc = roc_auc_score(targets, preds)
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.plot(fpr, tpr, color="steelblue", lw=2, label=f"AUC = {auc:.3f}")
+        ax.plot([0, 1], [0, 1], "k--", lw=1, label="Hasard (0.5)")
+        ax.set_xlabel("Taux faux positifs")
+        ax.set_ylabel("Taux vrais positifs")
+        ax.set_title(f"Courbe ROC — val set (epoch {ckpt['epoch']})")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("Le checkpoint ne contient pas de prédictions val. Relance l'entraînement.")
+else:
+    print("Pas de checkpoint ni de courbe ROC. Lance d'abord l'entraînement.")
+```
+
+## 11. Tableau récapitulatif par epoch
+
+```{python}
+#| echo: false
+if logs_ok:
+    display_df = df.copy()
+    display_df["auc"] = display_df["auc"].apply(
+        lambda x: f"{x:.4f}" if x is not None else "—"
+    )
+    display_df["train_loss"] = display_df["train_loss"].apply(lambda x: f"{x:.4f}")
+    display_df["val_loss"]   = display_df["val_loss"].apply(lambda x: f"{x:.4f}")
+    display_df["is_best"]    = display_df["is_best"].apply(lambda x: "✓" if x else "")
+    display_df = display_df.rename(columns={
+        "epoch": "Epoch", "train_loss": "Train Loss", "val_loss": "Val Loss",
+        "auc": "AUC", "time_s": "Temps (s)", "is_best": "Best"
+    })
+    display_df.index = display_df["Epoch"]
+    display_df = display_df.drop(columns=["Epoch"])
+    display(display_df)
+```

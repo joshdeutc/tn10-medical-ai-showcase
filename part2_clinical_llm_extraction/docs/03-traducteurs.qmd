@@ -1,0 +1,312 @@
+---
+title: "Three translators, one protocol"
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+import sys
+sys.path.insert(0, ".")
+from _outils import *          # noqa: F403
+```
+
+*Code covered: the model-loading part of `tools/traduire_paragraphes.py`.*
+
+## The joint: one function, one signature
+
+The whole translation pipeline rests on a one-line contract:
+
+```python
+translate(texts: list[str]) -> list[str]
+```
+
+As many outputs as inputs, in the same order. Nothing else. Each translator supplies its
+own implementation, and the rest of the code — segmentation, protection, loop, CSV
+writing — does not know which one is running.
+
+That is what makes it possible to add a translator by writing one single function, and
+it is why swapping translators never touched anything else: the joint sits exactly on
+the boundary between what depends on the model and what does not.
+
+## The three models
+
+| | HPLT | TranslateGemma | MiLMMT-46 |
+|---|---|---|---|
+| checkpoint | `HPLT/translate-en-hr-v1.0-hplt_opus` | `google/translategemma-27b-it` | `xiaomi-research/MiLMMT-46-12B-v1.0` |
+| architecture | Marian, encoder-decoder | Gemma 3, multimodal | Gemma 3, decoder-only |
+| parameters | 77 M | 27 B | 12 B |
+| weights in bf16 | 0.15 GB | 55 GB | 24 GB |
+| context | **512 tokens** (hard limit) | 2,048 tokens (model card) | 131,072 (architecture) |
+| prompt shape | none, raw text | multimodal message template | text completion |
+| `transformers` | **4.26 – 4.30** | >= 4.50 | >= 4.50 |
+
+Three technically unrelated families, reduced to the same contract. Only MiLMMT-46 is
+loaded by the pipeline as it stands; the other two are here because the comparison is
+what selected it.
+
+::: {.callout-important}
+## Each translator runs at *its own* window
+
+The temptation, when comparing three translators, is to cap them all at the most
+constrained one — here HPLT and its 512 tokens — so that the comparison is "fair".
+
+That would be a protocol error, because **the intended comparison is not between
+translators**. Each translation is compared against the original English: the question
+is "does the extraction survive this move into Croatian?", not "which of the three is
+best?". Capping MiLMMT at HPLT's window would degrade the Croatian produced without
+teaching anything.
+
+Hence `--max-chars` being a per-translator option rather than a global constant.
+:::
+
+In practice HPLT's window constrains almost nobody, for the reason seen in the previous
+chapter: the median paragraph is 109 characters in English and 123 in Croatian, i.e.
+around forty tokens. The largest paragraph in the corpus (3,304 characters) is the only
+case that calls for splitting into sentences.
+
+## MiLMMT: a plain completion
+
+This is the translator that was kept, and the only one the current pipeline loads.
+
+```{python}
+#| echo: false
+#| output: asis
+montre("load", ou=PARAGRAPHES)
+```
+
+No chat template: the prompt is raw text, taken word for word from the model's
+documentation.
+
+```{python}
+#| echo: false
+print("Translate this from English to Croatian:")
+print("English: A right internal jugular central venous catheter was placed.")
+print("Croatian:")
+```
+
+The language labels come from `--src` and `--tgt`, and have to be the ones in the
+model's documentation (`English`, `Croatian`, not `en` or `hr`): an unrecognised label
+degrades the translation **without raising an error**.
+
+::: {.callout-warning}
+## Two traps in batched generation on a decoder
+
+**`padding_side = "left"`.** With right padding, the last position of each short
+sequence is a padding token: the model continues *from the padding* rather than from the
+end of the prompt. The output stays plausible, so the mistake is invisible.
+
+**Stripping the prompt off the output.** A completion model copies its input at the head
+of its generation. `gen[:, enc["input_ids"].shape[1]:]` keeps only what follows — and
+left padding makes that slice valid for the whole batch, since every sequence then has
+the same input length.
+
+The two points hold together: left padding is what makes the slice simple, and the
+simple slice is what makes the batch usable.
+:::
+
+## `budget`: the invisible truncation
+
+```{python}
+#| echo: false
+#| output: asis
+montre("budget", ou=PARAGRAPHES)
+```
+
+A fixed `max_new_tokens` is a trap. Set too low, the translation is **cut off
+mid-sentence, without an error**: the corpus ends up missing the end of every long
+segment, and nothing reports it — no exception, no warning, no counter.
+
+The function therefore computes a ceiling per batch, from the longest segment:
+
+```{python}
+#| output: asis
+budget = fonction("budget", PARAGRAPHES)
+tableau([{"longest segment": f"{n} chars",
+          "max_new_tokens": budget(["x" * n])}
+         for n in (80, 300, 1200, 3300, 8000)])
+```
+
+The constants are measured, not guessed: ~3.5 characters per token, and a factor of
+**2.0** of margin because Croatian consumes about 15 % more tokens than English, plus a
+reserve for atypical paragraphs. The `+ 64` covers very short paragraphs, where a
+multiplicative factor is not enough.
+
+The ceiling bounds the cost: beyond it, translating a single paragraph would monopolise
+the GPU. What makes this computation indispensable is developed in "The paragraph, a
+universal unit" — a ceiling set too low raises no error, it cuts the end off the text.
+
+## The batch sorted by length, and recursion on OOM {#sec-lots}
+
+```{python}
+#| echo: false
+#| output: asis
+fichier(PARAGRAPHES, "    def translate(texts: list[str])", "    return translate")
+```
+
+**Sorting by length is what makes the batch safe.** Within a batch, every sequence is
+padded up to the length of the longest one: a 1,200-character segment forces its 31
+neighbours to that size, and the activations overflow. Grouping segments of similar
+length removes that waste. The original order is restored at the end through the
+`output` dictionary, indexed on the initial position.
+
+The mechanism was written after an incident: an out-of-memory error at `batch_size=64`
+in bf16, on a note of 79 segments, discovered two hours after launch. Hence the second
+protection — **recursive re-splitting**:
+
+```
+batch of 32  --OOM-->  16 + 16  --OOM-->  8 + 8  ...  --OOM on 1 segment--> re-raise
+```
+
+An overflow then slows one note down, instead of losing three hours of a run. The
+stopping condition (`if len(indices) == 1: raise`) is necessary: a segment that does not
+pass on its own never will, and an unguarded recursion would run forever.
+
+## Two Python environments, and why {#sec-venvs}
+
+```{python}
+#| echo: false
+#| output: asis
+docstring(PARAGRAPHES)
+```
+
+The constraint is irreducible: HPLT requires `transformers` 4.26–4.30, Gemma 3 requires
+>= 4.50. No single version satisfies both.
+
+| environment | Python | `transformers` | for |
+|---|---|---|---|
+| `.venv312` | 3.12 | 5.5.0 | TranslateGemma, MiLMMT, extraction |
+| `.venv-hplt` | **3.11** | 4.28.1 | HPLT only |
+| `.venv-docs` | 3.12 | — | rendering this document |
+
+Python 3.11 for HPLT and not 3.12: `tokenizers` 0.13, forced by `transformers` 4.28, has
+no prebuilt wheel for 3.12 and building it from source fails. This is the kind of
+cascading constraint better written down once than rediscovered.
+
+Only `.venv312` is needed to run the pipeline as it stands. The other two exist because
+the comparison happened, and because this document has to be rendered without loading
+torch.
+
+## `main()`: what happens, in what order
+
+Everything above is a piece. `main()` is what assembles them, and its shape is one
+deliberate decision: **spend nothing on the GPU until every cheap check has passed.**
+
+### First, three checks that cost no GPU at all
+
+```{python}
+#| echo: false
+#| output: asis
+fichier(PARAGRAPHES, "    notes = pd.read_csv(ROOT / args.data)", "    out = ROOT / args.out")
+```
+
+In order: read the corpus, optionally keep one note in N (`--shard`, one process per
+GPU), then **split every note and re-join it without translating** and check that the
+`___` count comes back unchanged. That round trip exercises `split`, `sentences` and the
+re-joining on the real corpus, in about two seconds, and it fails before a single byte of
+model has been downloaded. `plan_vram` then estimates the footprint from `--batch` and
+`--max-chars` — also before loading.
+
+The pattern is worth naming: the two checks that could invalidate a run of several hours
+both run in the first three seconds.
+
+### Then resume, and only then load the model
+
+```{python}
+#| echo: false
+#| output: asis
+fichier(PARAGRAPHES, "    out = ROOT / args.out", "    for k, row in enumerate")
+```
+
+The output CSV **is** the ledger. Notes whose `id_note` already appears in it are
+subtracted; if nothing is left, the function returns *before* `load()` is called. So
+relaunching a finished run costs nothing, and relaunching an interrupted one loads the
+model only when there is work.
+
+### The batch: what exactly runs in parallel {#sec-lot-quoi}
+
+This is the question the code does not answer on its own. `--batch 24` does not mean 24
+notes, and it does not mean 24 characters or 24 sentences. **One element of a batch is one
+call, and one call is one paragraph** — 92.2 % of the time. The other 7.8 % are pieces of
+a paragraph that exceeded `--max-chars` and was cut on sentence boundaries.
+
+Measured on the 249 English notes, at the defaults:
+
+```{python}
+#| echo: false
+#| output: asis
+import math, statistics as st
+import pandas as pd
+# `split` appelle `paragraphs` et `sentences` : fonction() n'injecte que `re`,
+# donc on lui passe les deux dépendances explicitement.
+paragraphs = fonction("paragraphs", PARAGRAPHES)
+sentences = fonction("sentences", PARAGRAPHES)
+split = fonction("split", PARAGRAPHES, paragraphs=paragraphs, sentences=sentences)
+notes = [str(x) for x in
+         pd.read_excel(RACINE / "CATH-LLM" / "exampleNotes_250.xlsx")["input"].dropna()]
+calls = [len(split(t, 1000)) for t in notes]
+batches = [math.ceil(c / 24) for c in calls]
+tableau([
+    {"quantity": "paragraphs in a note", "median": int(st.median([len(paragraphs(t)) for t in notes])),
+     "max": max(len(paragraphs(t)) for t in notes)},
+    {"quantity": "calls in a note", "median": int(st.median(calls)), "max": max(calls)},
+    {"quantity": "batches of 24 in a note", "median": int(st.median(batches)), "max": max(batches)},
+])
+print(f"\n{sum(calls)} calls in {sum(batches)} batches over the 249 notes — "
+      f"{sum(1 for b in batches if b == 1)} notes fit in a single batch.")
+```
+
+So the answer to "how many paragraphs at once": **up to 24, but never more than the note
+itself contains.** `translate()` is called once per note, so a batch never spans two
+notes. The median note has 40 calls, which is two batches: one full, one of sixteen.
+
+::: {.callout-note}
+## The cost of batching per note
+
+240 of the 249 notes end on an incomplete batch, half full on average. Batching across
+note boundaries would recover that, and it is deliberately not done: the resume ledger
+works at note granularity, so a batch that spans two notes would make an interruption
+ambiguous — one note half written, and no way to say so in the CSV.
+
+Paying about half a batch per note buys an interruption that costs exactly one note. On a
+run of several hours, that was the right side of the trade.
+:::
+
+### The loop itself
+
+```{python}
+#| echo: false
+#| output: asis
+fichier(PARAGRAPHES, "    for k, row in enumerate(todo.itertuples(), 1)", "    res = pd.DataFrame(done)")
+```
+
+Five steps per note, and every one of them is reversible on its own: `split` cuts,
+`protect` turns the `___` into integers, `translate` runs the batches, `restore` puts the
+`___` back and counts what did not come back, and the pieces are re-joined with blank
+lines — which reconstitutes the paragraph structure without anyone having described it.
+
+The CSV is rewritten after **every** note. That costs milliseconds against a translation
+measured in seconds, and it is what makes the ledger true at all times rather than at the
+end.
+
+The per-note line printed on the way is the whole monitoring: number of calls, characters
+in and out, the length ratio, and a warning when that ratio drops below 0.7 or when a
+marker was lost. Watching the first three lines is enough to know whether a run of
+several hours is worth leaving alone — which is the lesson of case 5 in the appendix.
+
+## Takeaways
+
+- One single contract, `translate(list[str]) -> list[str]`, isolates three unrelated
+  architectures. Adding or removing a translator touches one function.
+- Each translator runs at its own window: the intended comparison is
+  translation/English, never translator/translator.
+- The three silent failure modes in this chapter — wrong architecture instantiated,
+  right padding, fixed `max_new_tokens` — all produce a *plausible* output. None is
+  detectable without an explicit check.
+- Sorting by length makes the batch efficient; recursion on out-of-memory makes it safe.
+- One element of a batch is **one paragraph**, not one note and not one sentence — 24 in
+  parallel at most, and never more than the note itself holds, since `translate()` runs
+  once per note.
+- `main()` spends nothing on the GPU until the cheap checks have passed: the split/re-join
+  round trip and the VRAM estimate both run in the first three seconds.
+- The output CSV doubles as the progress ledger: resuming is free, and a finished run
+  returns before the model is even loaded.

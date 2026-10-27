@@ -1,0 +1,64 @@
+# Independent documents rather than a book: each chapter renders its own PDF.
+# A 46-page PDF does not get read; six documents of six pages get distributed, read
+# separately and updated one at a time. Cross-references from one chapter to another
+# have therefore been replaced by the target chapter's title, spelled out.
+project:
+  type: default
+  output-dir: _sortie
+  render:
+    - 01-paragraphes.qmd
+    - 02-redactions.qmd
+    - 03-traducteurs.qmd
+    - 04-extraction.qmd
+    - 05-verification.qmd
+    - a1-pieges.qmd
+
+date: today
+date-format: "D MMMM YYYY"
+subtitle: "Central venous catheter detection — the code explained"
+
+lang: en
+number-sections: true
+bibliography: []
+
+execute:
+  echo: true
+  warning: false
+  freeze: false
+
+format:
+  html:
+    theme:
+      light: cosmo
+      dark: darkly
+    toc: true
+    toc-depth: 3
+    code-overflow: wrap
+    code-copy: true
+    df-print: kable
+  pdf:
+    documentclass: scrreprt
+    papersize: a4
+    geometry:
+      - margin=2.4cm
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-overflow: wrap
+    highlight-style: github
+    colorlinks: true
+    include-in-header:
+      text: |
+        % The sources contain pictograms (warnings in the logs): with no fallback
+        % font, xelatex would silently replace them with nothing.
+        \usepackage{newunicodechar}
+        \newunicodechar{⚠}{[!]}
+        \newunicodechar{✅}{[ok]}
+        \newunicodechar{⛔}{[X]}
+        \newunicodechar{️}{}
+        \newunicodechar{×}{$\times$}
+        \newunicodechar{Δ}{$\Delta$}
+        \newunicodechar{→}{$\rightarrow$}
+        \newunicodechar{≥}{$\geq$}
+        \newunicodechar{≤}{$\leq$}
+        \newunicodechar{…}{...}

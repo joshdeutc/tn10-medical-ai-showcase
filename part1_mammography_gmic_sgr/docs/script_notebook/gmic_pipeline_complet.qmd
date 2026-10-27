@@ -1,0 +1,1759 @@
+---
+title: "Le pipeline de finetuning GMIC, ligne par ligne"
+subtitle: "Wrapper modèle, boucle d'entraînement et dataset — chaque ligne expliquée"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+jupyter: gmic
+---
+
+Ce document explique **chaque ligne** des trois fichiers qui composent le pipeline
+de finetuning GMIC du projet RSNA cancer du sein :
+
+1. `fine_tuning/gmic_finetune.py` — le **wrapper modèle** (forward d'entraînement,
+   construction, groupes de paramètres, gel du backbone) ;
+2. `fine_tuning/train_gmic.py` — la **boucle d'entraînement** intégrale (loss,
+   évaluation par sein, augmentation GPU, scheduler, AMP, early-stopping, CLI) ;
+3. `fine_tuning/dataset_gmic.py` — le **dataset** intégral (construction des
+   échantillons, augmentation CPU, sampler équilibré, split patient, loaders).
+
+On mélange deux niveaux de lecture :
+
+- 🧠 **la théorie** (pourquoi sigmoïde + BCE, pourquoi z-score, pourquoi
+  WeightedRandomSampler, pourquoi int16, etc.) ;
+- 💻 **le vrai code** du projet, recopié tel quel dans des blocs marqués
+  *« extrait réel »*.
+
+Les blocs *« extrait réel »* ne sont **pas exécutés** (ils dépendent du repo GMIC +
+données + GPU). Les blocs ▶️ **démo jouet** s'exécutent avec juste `torch` /
+`numpy` sur CPU et illustrent un concept en miniature.
+
+> Convention : dans chaque extrait, on numérote les lignes ou petits groupes de
+> lignes `(1)`, `(2)`, … et on les commente juste en dessous. Rien n'est survolé.
+
+---
+
+# 0. Vue d'ensemble du pipeline
+
+Avant de plonger dans le code, le schéma global. Trois fichiers, trois rôles :
+
+```text
+  dataset_gmic.py          gmic_finetune.py            train_gmic.py
+  ──────────────           ─────────────────           ──────────────
+  data.pkl                 GMICTrain(GMIC)             main() / argparse
+   │  load_and_split3        forward -> 3 têtes          build → freeze → optimizer
+   ▼  (train/abstain/val)    + saliency                 boucle epochs :
+  build_samples            build_gmic (strict=False)      train() / GPUAugment
+   │  (1 vue = 1 sample)    param_groups (LR discrim.)     compute_loss (BCE×3 + L1)
+   ▼                        freeze_backbone                evaluate (AUC par SEIN)
+  GMICViewDataset          set_backbone_eval              early-stopping / best.pt
+   │  (uint8/int16,
+   ▼   augment cv2)
+  WeightedRandomSampler ──► DataLoader (chemin frugal 16 bits) ──► GPU
+```
+
+L'**unité de données est la VUE** (GMIC traite une image à la fois), mais la
+**métrique de sélection est le SEIN** (on moyenne les vues CC+MLO d'un même côté).
+Cette distinction « per-view vs per-breast » revient partout — gardez-la en tête.
+
+---
+
+# 1. L'architecture GMIC en une page (contexte conceptuel)
+
+GMIC (*Globally-aware Multiple Instance Classifier*, NYU) est un classifieur de
+mammographies **full-résolution** (ici 2944×1920). Le naïf « je passe une image
+2944×1920 dans un ResNet » est trop coûteux en mémoire. GMIC contourne ça avec
+**deux branches** + une **fusion** :
+
+```text
+  image full-res (1, 2944, 1920)
+        │
+        ▼
+  ┌─────────────────┐   branche GLOBALE
+  │  ds_net (ResNet)│──► feature map ──► left_postprocess_net (conv 1x1)
+  └─────────────────┘                     │  = saliency maps par classe
+                                          ▼
+                             aggregation top-t%  ──► y_global (proba)
+                                          │
+        ┌─────────────────────────────────┘  (saliency détachée)
+        ▼
+  retrieve_roi_crops : greedy ROI, NON différentiable (numpy) ──► K=6 patchs
+        │
+        ▼
+  ┌─────────────────┐   branche LOCALE
+  │ dn_resnet(R-18) │──► h_crops (K vecteurs)
+  └─────────────────┘        │
+                             ▼
+                   attention_module (MIL) ──► z, y_local (proba)
+                             │
+        global_vec ──────────┤
+                             ▼
+                   fusion_dnn (Linear) ──► sigmoid ──► y_fusion (proba)
+```
+
+Les concepts à retenir :
+
+- **Branche globale (`ds_net`)** : un ResNet qui regarde l'image entière en basse
+  résolution interne et produit une *saliency map* (carte de chaleur) par classe.
+  L'agrégation **top-t %** prend la moyenne des `t %` pixels les plus chauds →
+  proba globale `y_global`.
+- **Region proposal (`retrieve_roi_crops`)** : à partir de la saliency map
+  **détachée du graphe**, une recherche **gloutonne en numpy** sélectionne les
+  `K=6` régions les plus saillantes. C'est **non différentiable** (aucun gradient
+  ne remonte par le *choix* des coordonnées) et ce module **n'a aucun poids**.
+- **Branche locale (`dn_resnet`, un ResNet-18)** : applique un vrai ResNet
+  haute-résolution sur chacun des K patchs 256×256 → K vecteurs de features.
+- **Attention MIL (`attention_module`)** : *Multiple Instance Learning* — pondère
+  les K patchs par une attention apprise, agrège en un vecteur `z` et une proba
+  `y_local`. Le MIL est l'idée « l'étiquette est au niveau de l'image, pas du
+  patch ; le réseau apprend seul quels patchs comptent ».
+- **Fusion (`fusion_dnn`)** : concatène le vecteur global et `z`, passe dans un
+  petit Linear + sigmoïde → `y_fusion`, la sortie principale.
+
+**Où vivent les poids (crucial pour le gel).** Les deux gros extracteurs sont
+enregistrés sur le module parent sous les noms **`ds_net`** (global) et
+**`dn_resnet`** (local). Tout le reste (`left_postprocess_net`,
+`attention_module`, `fusion_dnn`) est la **tête** légère. Ces noms suffisent à
+isoler le backbone (cf. §4).
+
+Cette section reste conceptuelle : ce code-là est upstream NYU. Ce qu'on documente
+ligne par ligne, c'est le **wrapper** du projet par-dessus.
+
+---
+
+# 2. `gmic_finetune.py` — le wrapper modèle
+
+## 2.1 En-tête et imports
+
+```python
+# === extrait réel : gmic_finetune.py ===
+import torch                                          # (1)
+import torch.nn as nn                                 # (2)
+
+from src.modeling.gmic import GMIC                     # (3)
+```
+
+`(1)` `torch` : le cœur de PyTorch (tenseurs, autograd, CUDA).
+`(2)` `torch.nn as nn` : le sous-module des couches/réseaux (`nn.Module`,
+`nn.functional.dropout`, etc.), aliasé `nn` par convention.
+`(3)` `from src.modeling.gmic import GMIC` : importe la classe GMIC **upstream**.
+Le `src.modeling...` ne résout que si le dossier `GMIC/` du repo est dans
+`sys.path` — c'est le script d'entraînement (`train_gmic.py`, §3.3) qui l'y insère
+**avant** d'importer ce module. D'où le commentaire du docstring : « ce module
+suppose que `GMIC/` est dans `sys.path` ».
+
+## 2.2 `class GMICTrain(GMIC)` — pourquoi sous-classer
+
+Le GMIC d'origine renvoie surtout `y_fusion` et garde des **buffers de
+visualisation** (il fait des `.cpu().numpy()` pour dessiner les heatmaps). Pour
+l'**entraînement**, on veut :
+
+- renvoyer **les 3 têtes** `y_fusion, y_global, y_local` + la `saliency_map` (la
+  loss supervise les trois, cf. §3.1) ;
+- **éviter les copies CPU inutiles** (pas de `self.patches` en numpy) ;
+- ajouter des **augmentations train-only** (rotation des patchs, dropout fusion).
+
+On ne réécrit donc **que le `forward`** ; tout le reste (construction des
+sous-réseaux, `add_layers`, `_retrieve_crop`…) est hérité de `GMIC`.
+
+```python
+# === extrait réel : gmic_finetune.py / class GMICTrain(GMIC) ===
+class GMICTrain(GMIC):                                                       # (1)
+    """GMIC avec un forward d'entrainement (multi-tete, sans buffers de visu)."""
+    def forward(self, x_original):                                           # (2)
+```
+
+`(1)` `GMICTrain(GMIC)` : héritage. `GMICTrain` **est un** GMIC, avec un forward
+différent. Le `__init__` n'est pas redéfini → on hérite de celui de GMIC (qui
+construit `global_network`, `local_network`, greffe `ds_net`/`dn_resnet`, etc.).
+`(2)` `forward(self, x_original)` : la méthode appelée quand on fait `model(x)`.
+`x_original` est le batch d'images full-res `(B, 1, 2944, 1920)`.
+
+## 2.3 Le forward, ligne par ligne
+
+### Branche globale
+
+```python
+# === extrait réel : gmic_finetune.py ===
+        # --- branche globale ---
+        h_g, self.saliency_map = self.global_network.forward(x_original)     # (1)
+        self.y_global = self.aggregation_function.forward(self.saliency_map) # (2)
+```
+
+`(1)` `self.global_network.forward(x_original)` : passe l'image entière dans la
+branche globale (le ResNet `ds_net` + post-traitement). Renvoie deux choses :
+`h_g`, la **feature map** brute (réutilisée à la fusion, §2.3 fusion), et
+`self.saliency_map`, la **carte de saillance par classe**. On les stocke comme
+attributs (`self.`) car la loss régularise la saliency (§3.1) et le region
+proposal la réutilise.
+`(2)` `self.aggregation_function.forward(self.saliency_map)` : agrégation
+**top-t %** — moyenne des `t %` pixels les plus chauds de la saliency → la proba
+**globale** `y_global`. C'est une opération bornée (moyenne de valeurs déjà
+passées par une activation) → `y_global` est **déjà une proba** dans `[0,1]`. À
+retenir pour la loss (BCE, pas BCEWithLogits).
+
+### Region proposal (non différentiable)
+
+```python
+# === extrait réel : gmic_finetune.py ===
+        # --- region proposal (non differentiable, numpy) ---
+        small_x_locations = self.retrieve_roi_crops.forward(                 # (1)
+            x_original, self.cam_size, self.saliency_map)
+        self.patch_locations = self._convert_crop_position(                  # (2)
+            small_x_locations, self.cam_size, x_original)
+```
+
+`(1)` `retrieve_roi_crops.forward(...)` : la recherche **gloutonne** des K régions
+les plus saillantes. Elle travaille **en numpy sur la saliency détachée** →
+**aucun gradient** ne passe par le choix des coordonnées. `self.cam_size` est la
+taille de la carte d'activation `(46, 30)` (cf. `default_parameters`).
+Renvoie `small_x_locations` : les positions des ROI **dans la grille basse-réso**.
+`(2)` `_convert_crop_position(...)` : convertit ces positions de la grille
+`cam_size` vers les **coordonnées en pixels** de l'image full-res `x_original`.
+Résultat `self.patch_locations` : où découper les patchs dans l'image originale.
+
+### Extraction des K patchs
+
+```python
+# === extrait réel : gmic_finetune.py ===
+        # --- extraction des patchs (pas de copie self.patches) ---
+        crops_variable = self._retrieve_crop(                                # (1)
+            x_original, self.patch_locations, self.retrieve_roi_crops.crop_method)
+        batch_size, num_crops, I, J = crops_variable.size()                  # (2)
+```
+
+`(1)` `_retrieve_crop(...)` : découpe effectivement les K patchs dans l'image
+full-res aux positions calculées. `crop_method` dit comment découper (centré,
+etc.). On garde le résultat en **tenseur GPU** (`crops_variable`), **sans** copie
+CPU numpy — c'est le « pas de copie `self.patches` » du commentaire, gain de
+temps à l'entraînement.
+`(2)` `crops_variable.size()` déballe les 4 dimensions du tenseur :
+`batch_size` (B images), `num_crops` (K=6 patchs par image), `I` et `J` (hauteur
+et largeur d'un patch, ici 256×256). On en aura besoin pour la rotation et le
+reshape.
+
+### Augmentation train-only : rotation des patchs
+
+```python
+# === extrait réel : gmic_finetune.py ===
+        # --- augmentation papier : rotation aleatoire {0,90,180,270} de chaque patch ---
+        if self.training and I == J:                                         # (1)
+            ks = torch.randint(0, 4, (batch_size, num_crops))                # (2)
+            crops_variable = torch.stack([                                   # (3)
+                torch.rot90(crops_variable[i, j], int(ks[i, j]), dims=(0, 1))
+                for i in range(batch_size) for j in range(num_crops)
+            ]).view(batch_size, num_crops, I, J)                             # (4)
+```
+
+`(1)` `if self.training and I == J:` — deux garde-fous. `self.training` est le
+drapeau basculé par `model.train()` / `model.eval()` : l'augmentation ne se fait
+**qu'en entraînement** (jamais en évaluation, où on veut un résultat
+déterministe). `I == J` vérifie que le patch est **carré** : une rotation de 90°
+sur un patch non carré changerait la forme du tenseur.
+`(2)` `torch.randint(0, 4, (batch_size, num_crops))` : tire un entier aléatoire
+dans `{0,1,2,3}` pour **chaque** patch de chaque image (matrice `B×K`). Ce sera le
+nombre de quarts de tour.
+`(3)` `torch.rot90(crops_variable[i, j], int(ks[i,j]), dims=(0,1))` : applique
+`ks[i,j]` rotations de 90° au patch `(i,j)`, dans le plan `(hauteur, largeur)`.
+La compréhension `for i ... for j ...` parcourt tous les patchs ; `torch.stack`
+empile les `B*K` patchs tournés en un seul tenseur.
+`(4)` `.view(batch_size, num_crops, I, J)` : remet la forme `(B, K, I, J)`.
+**Pourquoi cette augmentation ?** Sur un patch carré, `rot90` est **sans perte
+d'information** (juste une réorientation), et ça force le ResNet local à ne pas
+mémoriser une orientation fixe → anti-overfit (recette de l'article GMIC).
+
+▶️ **Démo jouet** : `rot90` est exactement inversible (sans perte).
+
+```{python}
+import torch
+patch = torch.arange(9.).reshape(3, 3)
+print("original :\n", patch)
+r = torch.rot90(patch, 1, dims=(0, 1))    # 1 quart de tour
+print("rot90 x1 :\n", r)
+# 4 quarts de tour = identite (donc 'sans perte')
+back = torch.rot90(patch, 4, dims=(0, 1))
+print("rot90 x4 == original ?", torch.equal(back, patch))
+```
+
+### Reshape pour la branche locale
+
+```python
+# === extrait réel : gmic_finetune.py ===
+        crops_variable = crops_variable.view(batch_size * num_crops, I, J).unsqueeze(1)  # (1)
+        # --- branche locale + MIL attention ---
+        h_crops = self.local_network.forward(crops_variable).view(batch_size, num_crops, -1)  # (2)
+        z, self.patch_attns, self.y_local = self.attention_module.forward(h_crops)            # (3)
+```
+
+`(1)` `.view(batch_size * num_crops, I, J)` aplatit les dimensions image et patch :
+on traite les `B*K` patchs comme un gros « batch » de petites images, ce qu'attend
+un ResNet 2D. `.unsqueeze(1)` insère une dimension de canal en position 1 →
+`(B*K, 1, I, J)` (1 canal, niveaux de gris).
+`(2)` `self.local_network.forward(...)` : le ResNet-18 local extrait un vecteur
+de features par patch. `.view(batch_size, num_crops, -1)` re-sépare les patchs par
+image : `(B, K, D)` où `D` est la dimension du vecteur (le `-1` la déduit).
+`(3)` `attention_module.forward(h_crops)` : le module **MIL attention**. Renvoie
+`z` (vecteur agrégé pondéré par l'attention), `self.patch_attns` (les poids
+d'attention par patch, utiles pour la visu), et `self.y_local` (proba **locale**,
+déjà bornée par l'attention → encore une **proba**, pas un logit).
+
+### Fusion
+
+```python
+# === extrait réel : gmic_finetune.py ===
+        # --- fusion ---
+        g1, _ = torch.max(h_g, dim=2)                                        # (1)
+        global_vec, _ = torch.max(g1, dim=2)                                 # (2)
+        concat_vec = torch.cat([global_vec, z], dim=1)                       # (3)
+        p_drop = self.experiment_parameters.get("dropout", 0.0)              # (4)
+        if p_drop > 0:                                                       # (5)
+            concat_vec = nn.functional.dropout(concat_vec, p=p_drop, training=self.training)
+        self.y_fusion = torch.sigmoid(self.fusion_dnn(concat_vec))           # (6)
+        return self.y_fusion, self.y_global, self.y_local, self.saliency_map # (7)
+```
+
+`(1)`-`(2)` `torch.max(h_g, dim=2)` puis `torch.max(g1, dim=2)` : un **global max
+pooling** en deux temps sur la feature map globale `h_g`. `torch.max` renvoie un
+couple `(valeurs, indices)` ; on ne garde que les valeurs (`_` ignore les
+indices). Deux `max` successifs réduisent les deux dimensions spatiales (hauteur
+puis largeur) → `global_vec`, le **résumé vectoriel de la branche globale**.
+`(3)` `torch.cat([global_vec, z], dim=1)` : concatène le résumé global et le
+résumé local `z` le long de la dimension des features (`dim=1`) → le vecteur qui
+nourrit la fusion.
+`(4)` `self.experiment_parameters.get("dropout", 0.0)` : récupère le taux de
+dropout des hyperparamètres (défaut `0.0` si absent).
+`(5)` `if p_drop > 0:` — applique le dropout **seulement s'il est demandé**.
+`nn.functional.dropout(..., training=self.training)` : le dropout n'agit **qu'en
+entraînement** (`training=self.training`) ; en eval il est neutre. C'est une
+régularisation train-only sur l'entrée du classifieur.
+`(6)` `torch.sigmoid(self.fusion_dnn(concat_vec))` : `fusion_dnn` est le Linear de
+fusion (produit un logit) ; **on lui applique explicitement `sigmoid`** → `y_fusion`
+est **une proba**. C'est ICI que `y_fusion` devient borné `[0,1]`.
+`(7)` `return ...` : on renvoie les **3 têtes + la saliency**, dans cet ordre. Le
+reste du pipeline (loss, evaluate) dépend de cet ordre exact.
+
+> **Piège n°1 du projet (la double-sigmoïde).** Les **trois** sorties sont **déjà
+> des probabilités**. La loss devra donc être `binary_cross_entropy` (qui attend
+> des probas), **jamais** `BCEWithLogits` (qui ré-applique une sigmoïde). On y
+> revient en détail au §3.1.
+
+## 2.4 `default_parameters` — les hyperparamètres d'architecture
+
+```python
+# === extrait réel : gmic_finetune.py ===
+def default_parameters(percent_t=0.02, gpu_number=0, device_type="gpu", dropout=0.0):  # (1)
+    return {
+        "device_type": device_type,        # (2)
+        "gpu_number": gpu_number,
+        "max_crop_noise": (100, 100),       # (3)
+        "max_crop_size_noise": 100,
+        "cam_size": (46, 30),               # (4)
+        "K": 6,                             # (5)
+        "crop_shape": (256, 256),           # (6)
+        "post_processing_dim": 256,         # (7)
+        "num_classes": 2,                   # (8)
+        "use_v1_global": False,             # (9)
+        "percent_t": percent_t,             # (10)
+        "dropout": dropout,                 # (11)
+    }
+```
+
+`(1)` Signature avec valeurs par défaut. Ces valeurs **reproduisent** celles du
+`run_model.py` upstream (modèle ResNet-18 NYU) — on ne change que ce qui est
+exposé en argument.
+`(2)` `device_type` / `gpu_number` : où tourne le modèle (GPU 0 ici).
+`(3)` `max_crop_noise` / `max_crop_size_noise` : bruit aléatoire sur la
+position/taille des crops ROI (augmentation interne GMIC).
+`(4)` `cam_size = (46, 30)` : la taille de la *class activation map* (la grille
+basse-réso de la saliency). C'est le `self.cam_size` utilisé dans le forward.
+`(5)` `K = 6` : nombre de patchs ROI extraits (le `num_crops` du forward).
+`(6)` `crop_shape = (256, 256)` : taille d'un patch — carré (d'où le `I == J` qui
+autorise `rot90`).
+`(7)` `post_processing_dim = 256` : dimension de sortie du post-traitement.
+`(8)` `num_classes = 2` : nos deux classes `[benign, malignant]`.
+`(9)` `use_v1_global = False` : utilise la version V2 du réseau global.
+`(10)` `percent_t` : le `t` de l'agrégation **top-t %** (défaut 2 %). Plus il est
+petit, plus l'agrégation se concentre sur les pixels les plus chauds.
+`(11)` `dropout` : le taux de dropout fusion (celui lu dans le forward `(4)`).
+
+## 2.5 `build_gmic` — construire et charger les poids NYU
+
+```python
+# === extrait réel : gmic_finetune.py ===
+def build_gmic(weights_path, parameters, device):                                # (1)
+    model = GMICTrain(parameters)                                                # (2)
+    if weights_path:                                                             # (3)
+        state = torch.load(weights_path, map_location="cpu", weights_only=False) # (4)
+        missing, unexpected = model.load_state_dict(state, strict=False)         # (5)
+        print(f"[build_gmic] charge {weights_path}")
+        if missing:                                                              # (6)
+            print(f"  missing keys    ({len(missing)}): {missing}")
+        if unexpected:                                                           # (7)
+            print(f"  unexpected keys ({len(unexpected)}): {unexpected}")
+    return model.to(device)                                                      # (8)
+```
+
+`(1)` Trois arguments : le chemin du checkpoint, les hyperparams (`default_parameters`),
+le device cible.
+`(2)` `GMICTrain(parameters)` : instancie notre sous-classe (poids initialisés
+aléatoirement à ce stade).
+`(3)` `if weights_path:` — on ne charge des poids que si un chemin est fourni
+(sinon entraînement *from scratch*).
+`(4)` `torch.load(..., map_location="cpu", weights_only=False)` :
+- `map_location="cpu"` : charge le checkpoint **en RAM CPU** (même s'il a été
+  sauvé depuis un GPU), pour éviter de remplir le GPU avant l'heure et rester
+  portable entre machines ;
+- `weights_only=False` : autorise le *unpickling* d'objets Python arbitraires (et
+  pas seulement des tenseurs). Nécessaire car le checkpoint NYU n'est pas un pur
+  `state_dict` de tenseurs.
+`(5)` `load_state_dict(state, strict=False)` : injecte les poids. **`strict=False`
+est essentiel** — le défaut `strict=True` planterait à la moindre clé qui diffère.
+Renvoie deux listes : `missing` (paramètres du modèle absents du checkpoint → ils
+gardent leur init aléatoire) et `unexpected` (clés du checkpoint absentes du
+modèle → ignorées). C'est exactement le comportement voulu en transfer learning :
+**réutiliser le backbone, réinitialiser la tête** redimensionnée à 2 classes.
+`(6)`-`(7)` On **imprime** les deux listes : c'est un garde-fou. Si `missing`
+contenait `ds_net.*`, ça signalerait que le backbone n'a pas été chargé.
+`(8)` `model.to(device)` : déplace **tout** le modèle (poids + buffers) sur le GPU
+en une fois, et le renvoie.
+
+▶️ **Démo jouet** : `strict=False` tolère clés absentes / en trop.
+
+```{python}
+import torch, torch.nn as nn
+
+ckpt = {
+    'feat.weight': torch.randn(4, 1), 'feat.bias': torch.randn(4),
+    'head.bias': torch.randn(2),   # head.weight ABSENT -> restera a l'init
+    'vieux_truc': torch.randn(3),  # clef EN TROP -> ignoree
+}
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.feat = nn.Linear(1, 4)   # backbone
+        self.head = nn.Linear(4, 2)   # tete 2 classes
+    def forward(self, x): return self.head(torch.relu(self.feat(x)))
+
+m = Net()
+missing, unexpected = m.load_state_dict(ckpt, strict=False)
+print('missing    :', missing)     # ['head.weight']
+print('unexpected :', unexpected)  # ['vieux_truc']
+```
+
+## 2.6 `_BACKBONE_PREFIXES` et `param_groups` — LR discriminatif
+
+```python
+# === extrait réel : gmic_finetune.py ===
+# Noms des sous-modules backbone (greffes sur le module parent par add_layers)
+_BACKBONE_PREFIXES = ("ds_net", "dn_resnet")                                  # (1)
+
+def param_groups(model, lr_backbone, lr_head):                                # (2)
+    backbone, head = [], []                                                   # (3)
+    for name, p in model.named_parameters():                                  # (4)
+        if not p.requires_grad:                                               # (5)
+            continue
+        if name.startswith(_BACKBONE_PREFIXES):                               # (6)
+            backbone.append(p)
+        else:                                                                 # (7)
+            head.append(p)
+    n_bb = sum(p.numel() for p in backbone)                                    # (8)
+    n_hd = sum(p.numel() for p in head)
+    print(f"[param_groups] backbone={n_bb/1e6:.2f}M @ lr={lr_backbone} | "
+          f"head={n_hd/1e6:.2f}M @ lr={lr_head}")
+    return [                                                                   # (9)
+        {"params": backbone, "lr": lr_backbone},
+        {"params": head, "lr": lr_head},
+    ]
+```
+
+`(1)` `_BACKBONE_PREFIXES = ("ds_net", "dn_resnet")` : les deux préfixes de noms
+qui identifient le backbone. **Pourquoi seulement deux noms suffisent ?** Les
+classes `GlobalNetwork`/`LocalNetwork` héritent d'`AbstractMILUnit`, qui **n'est
+pas** un `nn.Module`. Donc `self.global_network = GlobalNetwork(...)` n'enregistre
+**rien** dans le `state_dict` (le `__setattr__` de `nn.Module` ignore les objets
+non-Module). Les ResNet ne sont enregistrés que par la **greffe** `add_layers()`
+qui fait `self.parent_module.ds_net = ...` et `self.parent_module.dn_resnet = ...`.
+Résultat : dans `named_parameters()`, les poids des deux ResNet apparaissent
+**uniquement** sous les préfixes `ds_net.*` et `dn_resnet.*`.
+`(2)` Trois arguments : le modèle et **deux** learning rates (backbone bas, tête
+haute) — c'est le *LR discriminatif*.
+`(3)` Deux listes vides : on va trier les paramètres.
+`(4)` `model.named_parameters()` : itère sur `(nom, tenseur)` de tous les
+paramètres.
+`(5)` `if not p.requires_grad: continue` : **saute** les paramètres gelés. C'est
+ce `continue` qui, en mode `--freeze-backbone` (cf. §2.8), vide complètement le
+groupe backbone — il n'entre **jamais** dans l'optimiseur.
+`(6)` `name.startswith(_BACKBONE_PREFIXES)` : `str.startswith` accepte un **tuple**
+de préfixes (vrai si le nom commence par l'un d'eux) → le param va dans `backbone`.
+`(7)` `else: head.append(p)` : tout le reste (postprocess, attention, fusion) va
+dans la tête.
+`(8)` On compte les params de chaque groupe (`p.numel()` = nombre d'éléments) et
+on les imprime en millions — log de contrôle (« backbone=13.98M @ 1e-5 |
+head=0.13M @ 1e-4 »).
+`(9)` On renvoie une **liste de groupes** au format attendu par les optimiseurs
+PyTorch : chaque dict a ses `params` et son `lr` propre.
+
+## 2.7 `freeze_backbone` — le gel (linear-probe)
+
+```python
+# === extrait réel : gmic_finetune.py ===
+def freeze_backbone(model):                                                   # (1)
+    n = 0                                                                     # (2)
+    for name, p in model.named_parameters():                                  # (3)
+        if name.startswith(_BACKBONE_PREFIXES):                               # (4)
+            p.requires_grad = False                                           # (5)
+            n += p.numel()                                                    # (6)
+    print(f"[freeze_backbone] {n/1e6:.2f}M params backbone geles (requires_grad=False)")
+```
+
+`(1)`-`(2)` Fonction qui gèle le backbone ; `n` comptera les params gelés.
+`(3)`-`(4)` On parcourt les paramètres et on filtre par les mêmes préfixes que
+`param_groups`.
+`(5)` `p.requires_grad = False` : **le geste central**. Trois effets en chaîne :
+1. au `backward()`, **aucun gradient** n'est calculé pour ce tenseur ;
+2. combiné au `continue` de `param_groups` `(5)`, il est **exclu de l'optimiseur** ;
+3. autograd **ne stocke plus** les activations intermédiaires de ces couches →
+   moins de mémoire, forward/backward plus rapides.
+`(6)` `n += p.numel()` cumule le compte ; le `print` affiche « 13.98M params
+gelés » sur le vrai run.
+
+## 2.8 `set_backbone_eval` — figer la BatchNorm (le piège n°2)
+
+`requires_grad=False` gèle les **poids**… mais **pas** les statistiques de
+BatchNorm ! Une couche BN garde des buffers `running_mean`/`running_var` qui, en
+mode `train()`, sont **mis à jour à chaque batch — même sans gradient**. Un
+backbone « gelé » verrait donc quand même ses BN **dériver** vers les stats du
+domaine RSNA, changeant ses sorties. On fige ça aussi :
+
+```python
+# === extrait réel : gmic_finetune.py ===
+def set_backbone_eval(model):                                                 # (1)
+    for name, module in model.named_modules():                                # (2)
+        if name.startswith(_BACKBONE_PREFIXES):                               # (3)
+            module.eval()                                                     # (4)
+```
+
+`(1)` Fonction à appeler **après chaque** `model.train()` (cf. §3.7).
+`(2)` `model.named_modules()` : itère sur les **modules** (≠ paramètres) —
+indispensable car `.eval()` est une méthode de module, pas de tenseur.
+`(3)` Même filtre de préfixes.
+`(4)` `module.eval()` : bascule `training=False` sur ce module → la BN utilise ses
+`running_mean/var` **figées** et **cesse de les mettre à jour**.
+
+> **Pourquoi le ré-appeler à chaque epoch ?** `model.train()` est **récursif** : il
+> remet *tous* les sous-modules (donc la BN du backbone) en mode train. Il faut
+> donc **re-figer** juste après, à chaque epoch.
+
+▶️ **Démo jouet** : `running_mean` dérive en `train()`, se fige en `eval()`.
+
+```{python}
+import torch, torch.nn as nn
+bn = nn.BatchNorm1d(3)
+bn.train()
+for _ in range(5):
+    bn(torch.randn(16, 3) + 10.0)
+print('apres train() :', [round(v, 2) for v in bn.running_mean.tolist()])
+bn.eval()
+frozen = bn.running_mean.clone()
+for _ in range(5):
+    bn(torch.randn(16, 3) + 100.0)   # donnees tres differentes
+print('apres eval()   :', [round(v, 2) for v in bn.running_mean.tolist()])
+print('inchange ?', torch.allclose(frozen, bn.running_mean))
+```
+
+---
+
+# 3. `train_gmic.py` — la boucle d'entraînement intégrale
+
+## 3.0 Docstring, imports et bootstrap de `sys.path`
+
+```python
+# === extrait réel : train_gmic.py ===
+import argparse                                                               # (1)
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np                                                            # (2)
+import torch
+import torch.nn as nn
+from torch.amp import autocast, GradScaler                                    # (3)
+from sklearn.metrics import roc_auc_score                                     # (4)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))    # (5)
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "GMIC"))                        # (6)
+sys.path.insert(0, PROJECT_ROOT)                                              # (7)
+
+from fine_tuning.dataset_gmic import make_loaders, INPUT_SIZE, _side          # (8)
+from fine_tuning.gmic_finetune import (                                       # (9)
+    build_gmic, default_parameters, param_groups, freeze_backbone, set_backbone_eval,
+)
+from fine_tuning.run_metadata import (                                        # (10)
+    make_run_dir, get_git_commit, write_run_readme, write_args_json, format_duration,
+)
+EPS = 1e-7                                                                     # (11)
+```
+
+`(1)` modules standard : `argparse` (CLI), `json`/`os`/`sys`/`time`, `pathlib.Path`.
+`(2)` numpy + torch + nn.
+`(3)` `from torch.amp import autocast, GradScaler` : les deux outils de la
+**mixed precision** (calcul en fp16/bf16 pour aller plus vite et tenir en mémoire).
+`(4)` `roc_auc_score` de scikit-learn : la métrique AUC.
+`(5)` `PROJECT_ROOT` : le dossier racine du repo, calculé en remontant **deux
+fois** depuis le fichier (`fine_tuning/train_gmic.py` → `fine_tuning/` → racine).
+`os.path.abspath(__file__)` rend le chemin absolu et robuste au cwd.
+`(6)`-`(7)` On **insère** `GMIC/` puis la racine en **tête** de `sys.path`
+(`insert(0, …)`) **avant** d'importer quoi que ce soit qui en dépend → c'est ce
+qui fait résoudre `from src.modeling.gmic import GMIC` dans `gmic_finetune.py`.
+L'ordre compte : `GMIC/` doit être trouvable.
+`(8)` on importe du dataset : `make_loaders`, la constante `INPUT_SIZE`
+`(2944,1920)`, et `_side` (réutilisé dans `evaluate` pour grouper par sein).
+`(9)` du wrapper : les 5 fonctions vues au §2.
+`(10)` `run_metadata` : utilitaires de **traçabilité** (créer le dossier de run,
+récupérer le commit git, écrire README/args.json, formater une durée).
+`(11)` `EPS = 1e-7` : la petite constante anti-`log(0)` de la BCE.
+
+## 3.1 `compute_loss` et `bce` — la loss 3 têtes (pièges BCE + .float())
+
+La loss de l'article GMIC supervise les **trois** sorties + régularise la saliency :
+
+$$ \mathcal{L} = \mathrm{BCE}(y_{fusion}) + \mathrm{BCE}(y_{global}) + \mathrm{BCE}(y_{local}) + \beta\,\lVert \mathrm{saliency} \rVert_1 $$
+
+```python
+# === extrait réel : train_gmic.py ===
+def bce(prob, target):                                                        # (1)
+    prob = prob.clamp(EPS, 1.0 - EPS)                                         # (2)
+    return nn.functional.binary_cross_entropy(prob, target)                  # (3)
+
+def compute_loss(y_fusion, y_global, y_local, saliency, target, beta):        # (4)
+    l_fus = bce(y_fusion.float(), target)                                     # (5)
+    l_glo = bce(y_global.float(), target)
+    l_loc = bce(y_local.float(), target)
+    l_reg = beta * saliency.float().abs().mean() if beta > 0 else 0.0         # (6)
+    total = l_fus + l_glo + l_loc + l_reg                                     # (7)
+    return total, {                                                           # (8)
+        "loss": float(total.detach()),
+        "bce_fusion": float(l_fus.detach()),
+        "bce_global": float(l_glo.detach()),
+        "bce_local": float(l_loc.detach()),
+        "l1_saliency": float(l_reg.detach()) if beta > 0 else 0.0,
+    }
+```
+
+`(1)`-`(3)` `bce(prob, target)` : un petit wrapper sûr.
+`(2)` `prob.clamp(EPS, 1.0 - EPS)` borne les probas dans `[1e-7, 1-1e-7]` →
+évite `log(0) = -inf` (la BCE calcule `log(prob)` et `log(1-prob)`).
+`(3)` `nn.functional.binary_cross_entropy(prob, target)` : la BCE **sur des
+probas**. C'est le **piège n°1** : les 3 sorties GMIC sont **déjà** sigmoïdées (cf.
+§2.3), donc on utilise `binary_cross_entropy` et **JAMAIS** `binary_cross_entropy_with_logits`.
+`BCEWithLogits` ré-appliquerait une sigmoïde en interne → **double sigmoïde** →
+gradients écrasés → le modèle *collapse*.
+`(4)` `compute_loss` reçoit les 4 sorties du forward + la cible + `beta`.
+`(5)` `bce(y_fusion.float(), target)` : le **piège n°2 — `.float()` hors autocast**.
+L'entraînement tourne en `autocast` (fp16). Or `binary_cross_entropy` n'est **pas
+autocast-safe** (instable / NaN en fp16). `.float()` **reconvertit en fp32** la
+sortie avant la BCE. Cet appel a lieu **hors** du `with autocast(...)` (cf. §3.7),
+donc le calcul se fait bien en fp32.
+`(6)` `l_reg = beta * saliency.float().abs().mean()` : la régularisation **L1** sur
+la saliency (`|saliency|` moyenné), pondérée par `beta`. Le `if beta > 0 else 0.0`
+évite tout calcul si la régularisation est désactivée. `.float()` ici aussi.
+`(7)` `total` : la somme des 4 termes — la loss optimisée.
+`(8)` On renvoie `(total, dict)`. Le dict contient les **valeurs détachées**
+(`.detach()` coupe le graphe autograd, `float(...)` ramène un python float) pour le
+**logging** sans fuite mémoire. `total` (tenseur), lui, garde son graphe pour le
+`backward()`.
+
+▶️ **Démo jouet** : pourquoi BCEWithLogits sur une proba est faux.
+
+```{python}
+import torch, torch.nn.functional as F
+proba = torch.tensor([0.99, 0.01])     # DEJA une proba
+target = torch.tensor([1.0, 0.0])
+good = F.binary_cross_entropy(proba.clamp(1e-7, 1 - 1e-7), target)
+bad = F.binary_cross_entropy_with_logits(proba, target)   # traite 0.99 comme un logit
+print(f"BCE(proba) correct       = {good.item():.4f}")
+print(f"BCEWithLogits(proba) FAUX = {bad.item():.4f}  (sigmoid(0.99)=0.73 -> erreur gonflee)")
+```
+
+## 3.2 `GPUAugment` — augmentation kornia sur GPU
+
+Pourquoi déplacer l'augmentation sur GPU ? La VM a **8 vCPU** : elle est
+**CPU/IO-bound** (décoder les gros PNG sature les workers). En faisant
+l'augmentation sur GPU, les **workers CPU ne font plus que décoder** les PNG, et le
+GPU (sous-utilisé) absorbe l'affine + le gamma. Le flag `--gpu-augment` fait passer
+l'occupation GPU de ~49 % à ~91 %.
+
+```python
+# === extrait réel : train_gmic.py ===
+class GPUAugment(nn.Module):                                                  # (1)
+    def __init__(self, input_size=INPUT_SIZE, max_shift=(48, 32)):           # (2)
+        super().__init__()
+        import kornia.augmentation as K                                       # (3)
+        tx = max_shift[1] / input_size[1]                                     # (4)
+        ty = max_shift[0] / input_size[0]
+        self.affine = K.RandomAffine(                                         # (5)
+            degrees=15.0, translate=(tx, ty), scale=(0.9, 1.1),
+            p=1.0, same_on_batch=False, padding_mode="zeros")
+        self.gamma = K.RandomGamma(gamma=(0.8, 1.25), p=0.5, same_on_batch=False)  # (6)
+
+    def forward(self, x):                                                     # (7)
+        mx = x.amax(dim=(1, 2, 3), keepdim=True).clamp(min=1.0)               # (8)
+        x = x / mx                                                            # (9)
+        x = self.affine(x)                                                    # (10)
+        x = self.gamma(x.clamp(0.0, 1.0))                                     # (11)
+        return x
+```
+
+`(1)` `GPUAugment(nn.Module)` : un module (donc déplaçable sur GPU via `.to(device)`).
+`(2)` `max_shift=(48, 32)` : translation max en pixels `(dy_max, dx_max)`.
+`(3)` `import kornia.augmentation as K` : kornia fait des augmentations
+**différentiables sur GPU** (équivalents GPU des transforms torchvision).
+`(4)` kornia attend la translation en **fractions** de la taille : `tx` = décalage
+horizontal max / largeur, `ty` = vertical / hauteur. Noter l'inversion d'index
+`max_shift[1]` (dx) avec `input_size[1]` (W) — cohérent.
+`(5)` `K.RandomAffine(...)` : une seule affine combinant rotation **±15°**, scale
+**0.9–1.1**, translation. `p=1.0` (toujours appliquée), `same_on_batch=False`
+(transformation différente par image du batch), `padding_mode="zeros"` (fond noir
+= le fond du crop mammo, cohérent visuellement).
+`(6)` `K.RandomGamma(gamma=(0.8, 1.25), p=0.5)` : jitter **gamma** (correction non
+linéaire de luminance), appliqué une fois sur deux (`p=0.5`). **Pourquoi gamma et
+pas luminosité/contraste linéaires ?** Le z-score en aval (§3.3) **annule toute
+échelle linéaire** → seul un gamma **non linéaire** survit à la normalisation.
+Noter : **pas de hflip** — les vues sont déjà normalisées chest-wall-à-gauche.
+`(7)` `forward(x)` : `x` est un batch float `(B,1,H,W)`, à échelle libre (uint8
+`[0,255]` ou uint16 natif 12 bits).
+`(8)` `x.amax(dim=(1,2,3), keepdim=True)` : le **max par image** (réduit canaux +
+H + W, garde la dim pour le broadcast). `.clamp(min=1.0)` évite la division par 0.
+`(9)` `x = x / mx` : normalise chaque image par son propre max → `[0,1]`. Ça rend
+le gamma **scale-aware** : pour de l'uint8 minmax-stretché (max ~255) c'est comme
+l'historique `/255`, pour du 16 bits natif le gamma garde la même force relative.
+`(10)` `self.affine(x)` : applique l'affine GPU.
+`(11)` `self.gamma(x.clamp(0.0, 1.0))` : `clamp` garde l'image dans `[0,1]` (l'affine
+a pu introduire de légers dépassements) avant le gamma. On renvoie l'image
+augmentée — le z-score viendra **après**, dans la boucle.
+
+## 3.3 `gpu_standardize` — le z-score par image
+
+```python
+# === extrait réel : train_gmic.py ===
+def gpu_standardize(x):                                                       # (1)
+    x = x.float()                                                             # (2)
+    m = x.mean(dim=(1, 2, 3), keepdim=True)                                   # (3)
+    s = x.std(dim=(1, 2, 3), keepdim=True, unbiased=False).clamp(min=1e-5)    # (4)
+    return (x - m) / s                                                        # (5)
+```
+
+`(1)`-`(2)` `x = x.float()` : convertit en fp32 (l'entrée peut être uint8/int16 →
+on a besoin de flottants pour la moyenne/écart-type).
+`(3)` `m = x.mean(dim=(1,2,3), keepdim=True)` : moyenne **par image** (sur canal +
+H + W). `keepdim=True` garde la forme `(B,1,1,1)` pour le broadcast.
+`(4)` `x.std(..., unbiased=False)` : écart-type **biaisé** (diviseur `N`, pas
+`N-1`) — convention de normalisation d'image. `.clamp(min=1e-5)` empêche la
+division par 0 pour une image uniforme.
+`(5)` `(x - m) / s` : le **z-score par image** — centre à 0, échelle à 1. C'est le
+`standard_normalize` attendu par GMIC. **Conséquence clé** : ça **annule toute
+transformation linéaire d'intensité et toute échelle de bits** → c'est pourquoi le
+dataset peut transférer en uint8/int16 sans normaliser (§4.3) et pourquoi le gamma
+non linéaire est la seule augmentation d'intensité utile.
+
+## 3.4 `evaluate` — AUC par VUE puis agrégation par SEIN
+
+C'est le cœur de la métrique « per-breast ». GMIC s'entraîne **par vue**, mais
+l'étiquette clinique RSNA est **par sein** (un côté = CC + MLO). On évalue donc
+chaque vue, puis on **moyenne les probas des vues d'un même sein**.
+
+```python
+# === extrait réel : train_gmic.py ===
+@torch.no_grad()                                                              # (1)
+def evaluate(model, loader, samples, device, beta):
+    model.eval()                                                              # (2)
+    preds_b, preds_m, preds_gm, preds_lm, labs = [], [], [], [], []           # (3)
+    running = 0.0
+    n = 0
+    for x, y in loader:                                                       # (4)
+        x = gpu_standardize(x.to(device, non_blocking=True))                  # (5)
+        yt = y.to(device)
+        with autocast("cuda"):                                                # (6)
+            yf, yg, yl, sal = model(x)
+        total, _ = compute_loss(yf, yg, yl, sal, yt, beta)                    # (7)
+        running += float(total) * x.size(0)                                   # (8)
+        n += x.size(0)
+        yf = yf.float().cpu().numpy()                                         # (9)
+        yg = yg.float().cpu().numpy()
+        yl = yl.float().cpu().numpy()
+        preds_b.extend(yf[:, 0].tolist())                                     # (10)
+        preds_m.extend(yf[:, 1].tolist())
+        preds_gm.extend(yg[:, 1].tolist())  # malignant, tete GLOBAL
+        preds_lm.extend(yl[:, 1].tolist())  # malignant, tete LOCAL
+        labs.append(y.numpy())                                                # (11)
+```
+
+`(1)` `@torch.no_grad()` : décorateur qui **désactive autograd** dans toute la
+fonction → pas de graphe, moins de mémoire, plus rapide (on n'apprend pas en éval).
+`(2)` `model.eval()` : bascule **tout** le modèle en mode éval (BN figées, dropout
+neutre, et `self.training=False` → pas de rotation des patchs dans le forward).
+`(3)` listes d'accumulation : probas benign/malignant de la **fusion** (`preds_b`,
+`preds_m`), malignant des têtes **global** (`preds_gm`) et **local** (`preds_lm`),
+et les labels (`labs`). `running`/`n` pour la val_loss moyenne.
+`(4)` boucle sur le `val_loader` (séquentiel, cf. §4.4).
+`(5)` `x.to(device, non_blocking=True)` : transfert CPU→GPU **asynchrone**
+(`non_blocking=True` ne bloque que si la mémoire source est *page-locked*) ; puis
+`gpu_standardize` (z-score). **Pas** d'augmentation en éval.
+`(6)` `with autocast("cuda"):` — on évalue aussi en mixed precision (cohérence
+avec l'entraînement, et c'est plus rapide).
+`(7)` `compute_loss(...)` pour la `val_loss` ; on ignore le dict de détail (`_`).
+`(8)` `running += float(total) * x.size(0)` : somme pondérée par la **taille du
+batch** (`x.size(0)`) → moyenne correcte même si le dernier batch est plus petit.
+`(9)` `yf.float().cpu().numpy()` : reconvertit en fp32, **rapatrie sur CPU**, passe
+en numpy (sklearn travaille sur numpy). Idem `yg`, `yl`.
+`(10)` On extrait les colonnes : `[:, 0]` = benign, `[:, 1]` = malignant. `.extend`
+ajoute toutes les valeurs du batch à la liste plate.
+`(11)` `labs.append(y.numpy())` : on garde les labels du batch (concaténés plus
+loin).
+
+```python
+# === extrait réel : train_gmic.py (suite de evaluate) ===
+    labs = np.concatenate(labs)                                               # (12)
+    preds_m = np.array(preds_m)                                               # (13)
+    preds_b = np.array(preds_b)
+    preds_gm = np.array(preds_gm)
+    preds_lm = np.array(preds_lm)
+
+    def safe_auc(y_true, y_score):                                            # (14)
+        y_true = np.asarray(y_true)
+        return roc_auc_score(y_true, y_score) if (y_true.sum() > 0 and y_true.sum() < len(y_true)) else float("nan")
+```
+
+`(12)` `np.concatenate(labs)` : recolle les labels en un tableau `(N, 2)`.
+`(13)` conversions des listes de prédictions en arrays numpy.
+`(14)` `safe_auc` : un AUC **robuste**. `roc_auc_score` **plante** si l'ensemble ne
+contient qu'**une seule classe** (que des positifs ou que des négatifs). La
+condition `0 < y_true.sum() < len(y_true)` garantit la présence des deux classes ;
+sinon on renvoie `nan` (géré plus loin dans le log et l'early-stopping).
+
+```python
+# === extrait réel : train_gmic.py (agregation par SEIN) ===
+    assert len(samples) == len(preds_m), (                                    # (15)
+        f"desalignement samples({len(samples)}) vs preds({len(preds_m)}) : "
+        "le loader val doit etre sequentiel (shuffle=False, drop_last=False)")
+    from collections import defaultdict                                       # (16)
+    g_m, g_b, g_gm, g_lm, g_ym, g_yb = (defaultdict(list), defaultdict(list),
+        defaultdict(list), defaultdict(list), {}, {})
+    for i, s in enumerate(samples):                                           # (17)
+        key = (s["pid"], _side(s["view"]))                                    # (18)
+        g_m[key].append(preds_m[i])                                           # (19)
+        g_b[key].append(preds_b[i])
+        g_gm[key].append(preds_gm[i])
+        g_lm[key].append(preds_lm[i])
+        g_ym[key] = int(s["label"][1])                                        # (20)
+        g_yb[key] = int(s["label"][0])
+    keys = list(g_m.keys())                                                   # (21)
+    exam_pm = np.array([float(np.mean(g_m[k])) for k in keys])                # (22)
+    exam_pb = np.array([float(np.mean(g_b[k])) for k in keys])
+    exam_pgm = np.array([float(np.mean(g_gm[k])) for k in keys])
+    exam_plm = np.array([float(np.mean(g_lm[k])) for k in keys])
+    exam_ym = np.array([g_ym[k] for k in keys])                               # (23)
+    exam_yb = np.array([g_yb[k] for k in keys])
+```
+
+`(15)` `assert len(samples) == len(preds_m)` : garde-fou **critique**. L'agrégation
+par sein suppose que `preds_m[i]` correspond à `samples[i]` — donc que le loader
+**n'a pas mélangé** l'ordre. Si le val_loader avait `shuffle=True` ou `drop_last=True`,
+l'alignement casserait → l'assertion l'attrape immédiatement.
+`(16)` `defaultdict(list)` : un dict qui crée une liste vide à la première clé
+inconnue. On en ouvre 4 (probas par sein) + 2 dicts normaux (labels par sein).
+`(17)`-`(18)` Pour chaque échantillon, la **clé du sein** est le couple
+`(pid, côté)` : `_side(s["view"])` renvoie `"left"`/`"right"` selon que la vue
+commence par `L`/`R`. Donc CC et MLO d'un même côté tombent **dans la même clé**.
+`(19)` On accumule les probas des vues de ce sein (fusion mal/ben, global, local).
+`(20)` On (ré)enregistre le **label du sein** (identique pour ses vues) :
+`s["label"][1]` = malignant, `[0]` = benign.
+`(21)` `keys` : la liste des seins distincts.
+`(22)` `np.mean(g_m[k])` : **la moyenne des probas des vues** d'un sein = la proba
+au **niveau sein**. Idem pour benign, global, local.
+`(23)` `exam_ym`/`exam_yb` : les labels par sein, dans le même ordre que `keys`.
+
+```python
+# === extrait réel : train_gmic.py (retour de evaluate) ===
+    return {                                                                  # (24)
+        "val_loss": running / max(n, 1),                                      # (25)
+        "auc_malignant": safe_auc(labs[:, 1], preds_m),                       # (26)
+        "auc_benign": safe_auc(labs[:, 0], preds_b),
+        "exam_auc_malignant": safe_auc(exam_ym, exam_pm),                     # (27)
+        "exam_auc_benign": safe_auc(exam_yb, exam_pb),
+        "auc_global_mal": safe_auc(labs[:, 1], preds_gm),                     # (28)
+        "auc_local_mal": safe_auc(labs[:, 1], preds_lm),
+        "exam_auc_global_mal": safe_auc(exam_ym, exam_pgm),                   # (29)
+        "exam_auc_local_mal": safe_auc(exam_ym, exam_plm),
+        "n_exams": len(keys),                                                 # (30)
+    }
+```
+
+`(24)` On renvoie un dict de métriques.
+`(25)` `val_loss` = somme pondérée / n total.
+`(26)` `auc_malignant`/`auc_benign` : AUC **par VUE** (fusion). Utile mais **pas**
+la métrique de sélection.
+`(27)` `exam_auc_malignant`/`exam_auc_benign` : AUC **par SEIN** (fusion). C'est
+**`exam_auc_malignant`** qui pilote l'early-stopping et le `best.pt` (§3.7).
+`(28)` AUC malignant **par vue** des têtes **global** et **local** séparément —
+diagnostic : voir laquelle des 3 têtes apprend.
+`(29)` Les mêmes têtes mais **par sein** — c'est ce que log la ligne `[têtes]`.
+`(30)` `n_exams` : nombre de seins évalués (pour contextualiser l'AUC).
+
+> **Le piège per-view vs per-breast.** Reporter l'AUC par vue surestime souvent la
+> performance clinique (deux vues corrélées du même sein « comptent double »). Le
+> projet reporte et sélectionne **par sein** (+~0.05 d'écart observé). C'est pour
+> ça que `evaluate` reçoit `samples` (pour connaître `pid`+`view` de chaque
+> prédiction) et impose l'ordre séquentiel.
+
+## 3.5 `save_ckpt` — sauvegarde d'un checkpoint complet
+
+```python
+# === extrait réel : train_gmic.py ===
+def save_ckpt(path, epoch, model, optimizer, scheduler, scaler, best_auc, logs):  # (1)
+    torch.save({                                                              # (2)
+        "epoch": epoch,
+        "model": model.state_dict(),                                          # (3)
+        "optimizer": optimizer.state_dict(),                                  # (4)
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "best_auc": best_auc,                                                 # (5)
+        "logs": logs,
+    }, path)
+```
+
+`(1)`-`(2)` On sauve **tout l'état** nécessaire à reprendre (`--resume`) ou à
+recharger le meilleur modèle, via `torch.save` (un dict picklé).
+`(3)` `model.state_dict()` : tous les poids + buffers (running_mean BN, etc.).
+`(4)` `optimizer`/`scheduler`/`scaler` `.state_dict()` : l'état de l'**optimiseur**
+(moments Adam), du **scheduler** (où en est le LR) et du **GradScaler** (l'échelle
+courante de la mixed precision). Indispensables pour une reprise **exacte**.
+`(5)` `best_auc` (le meilleur AUC sein atteint) + `logs` (l'historique par epoch).
+
+## 3.6 `main` — argparse, run dir, tee des logs
+
+```python
+# === extrait réel : train_gmic.py ===
+def main():
+    ap = argparse.ArgumentParser()                                           # (1)
+    ap.add_argument("--pkl", default="data/preprocess_image/data.pkl")       # (2)
+    ap.add_argument("--image-dir", default="data/preprocess_image/cropped_images")
+    ap.add_argument("--weights", default="GMIC/models/sample_model_1.p")     # (3)
+    ap.add_argument("--percent-t", type=float, default=0.02)                 # (4)
+    ap.add_argument("--epochs", type=int, default=40, help="plafond d'epochs ...")  # (5)
+    ap.add_argument("--patience", type=int, default=6, help="early stopping ...")   # (6)
+    ap.add_argument("--min-delta", type=float, default=1e-3, help="...")     # (7)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--lr-backbone", type=float, default=1e-5)               # (8)
+    ap.add_argument("--lr-head", type=float, default=1e-4)
+    ap.add_argument("--weight-decay", type=float, default=1e-5)
+    ap.add_argument("--beta", type=float, default=1e-4, help="poids L1 sur la saliency")  # (9)
+    ap.add_argument("--dropout", type=float, default=0.0, help="...")
+    ap.add_argument("--freeze-backbone", action="store_true", help="linear-probe ...")    # (10)
+    ap.add_argument("--warmup-epochs", type=int, default=1)
+    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--train-frac", type=float, default=2.0 / 3)             # (11)
+    ap.add_argument("--abstain-frac", type=float, default=1.0 / 6)
+    ap.add_argument("--val-frac", type=float, default=1.0 / 6)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--grad-clip", type=float, default=1.0)                  # (12)
+    ap.add_argument("--gpu-augment", action="store_true", help="...")        # (13)
+    ap.add_argument("--runs-root", default="fine_tuning/checkpoints/runs")   # (14)
+    ap.add_argument("--model-tag", default=None)
+    ap.add_argument("--out", default=None, help="court-circuite runs/ ...")  # (15)
+    ap.add_argument("--no-amp", action="store_true")                         # (16)
+    ap.add_argument("--resume", action="store_true")
+    args = ap.parse_args()                                                   # (17)
+```
+
+`(1)` un parseur d'arguments CLI.
+`(2)` `--pkl`/`--image-dir` : où sont les données (le pickle d'exams + le dossier
+des PNG croppés).
+`(3)` `--weights` : le checkpoint NYU (`strict=False`).
+`(4)` `--percent-t` : le `t` de l'agrégation top-t %.
+`(5)` `--epochs` : **plafond** d'epochs (l'early-stopping coupe souvent avant).
+`(6)` `--patience` : nb d'epochs **sans amélioration** de l'AUC sein avant arrêt.
+`(7)` `--min-delta` : amélioration **minimale** pour reset le compteur (évite de
+considérer un gain de bruit `1e-5` comme une amélioration).
+`(8)` `--lr-backbone`/`--lr-head` : le LR discriminatif (cf. `param_groups`).
+`(9)` `--beta` : poids de la régularisation L1 saliency.
+`(10)` `--freeze-backbone` : `action="store_true"` → un **flag** (présent=True).
+Active le linear-probe.
+`(11)` `--train-frac`/`--abstain-frac`/`--val-frac` : les parts du split à 3 voies
+(défaut 2/3, 1/6, 1/6). L'abstention est un held-out disjoint (§4.2).
+`(12)` `--grad-clip` : norme max des gradients (clipping, défaut 1.0).
+`(13)` `--gpu-augment` : flag pour l'augmentation kornia GPU.
+`(14)` `--runs-root`/`--model-tag` : racine + libellé de l'arborescence de runs.
+`(15)` `--out` : court-circuite `runs/` (rétro-compat avec d'anciens scripts qui
+donnaient un dossier en dur).
+`(16)` `--no-amp` (désactive la mixed precision) et `--resume` (reprend depuis
+`last.pt`).
+`(17)` `args = ap.parse_args()` : parse la ligne de commande.
+
+```python
+# === extrait réel : train_gmic.py ===
+    torch.manual_seed(args.seed)                                             # (1)
+    np.random.seed(args.seed)
+    device = torch.device("cuda")                                            # (2)
+    use_amp = not args.no_amp                                                # (3)
+
+    target = "cancer_malignant_gmic"                                         # (4)
+    if args.model_tag is None:                                               # (5)
+        args.model_tag = ("gmic_" + ("frozen" if args.freeze_backbone else "full-ft")
+                          + ("_gpu-aug" if args.gpu_augment else "_cpu-aug"))
+    if args.out:                                                             # (6)
+        run_dir = Path(args.out)
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        run_dir = make_run_dir(Path(args.runs_root), target, args.model_tag) # (7)
+    args.out = str(run_dir)
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    t_run0 = time.time()                                                     # (8)
+```
+
+`(1)` `torch.manual_seed` + `np.random.seed` : **reproductibilité** (mêmes tirages
+aléatoires pour torch et numpy).
+`(2)` `device = torch.device("cuda")` : on cible le GPU.
+`(3)` `use_amp = not args.no_amp` : la mixed precision est **active par défaut**,
+désactivable par `--no-amp`.
+`(4)` `target` : le nom logique de la cible (sert d'arborescence `runs/{target}/…`).
+`(5)` Si `--model-tag` non fourni, on en **fabrique un automatiquement** qui décrit
+le run : `gmic_frozen_gpu-aug`, `gmic_full-ft_cpu-aug`, etc. → les dossiers sont
+auto-documentés.
+`(6)` Si `--out` donné : on l'utilise tel quel (`mkdir parents=True, exist_ok=True`
+= crée toute l'arbo, sans erreur si elle existe).
+`(7)` Sinon `make_run_dir(...)` crée `runs/{target}/{model_tag}/{timestamp}/`.
+`(8)` On note l'heure de début (`started_at` lisible, `t_run0` pour chronométrer).
+
+```python
+# === extrait réel : train_gmic.py (tee des logs) ===
+    class _Tee:                                                              # (1)
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, s):                                                  # (2)
+            for st in self.streams:
+                st.write(s); st.flush()
+        def flush(self):
+            for st in self.streams:
+                st.flush()
+    _logf = open(run_dir / "train.log", "a", buffering=1)                    # (3)
+    sys.stdout = _Tee(sys.stdout, _logf)                                     # (4)
+    sys.stderr = _Tee(sys.stderr, _logf)
+    print("=" * 60)                                                         # (5)
+    print(f"Finetuning GMIC | run dir : {run_dir}")
+    for k, v in vars(args).items():                                          # (6)
+        print(f"  {k:14s}: {v}")
+    print("=" * 60)
+```
+
+`(1)`-`(2)` `_Tee` : une petite classe qui **duplique** toute écriture vers
+plusieurs flux. `write` écrit dans chaque flux et `flush` immédiatement (pas de
+perte si le process crash).
+`(3)` `open(run_dir/"train.log", "a", buffering=1)` : le fichier de log, en
+**append** (`"a"`), `buffering=1` = **line-buffered** (chaque ligne écrite tout de
+suite). On le fait **dans** `main` car le timestamp du run dir n'est connu qu'au
+lancement → impossible de `tee` depuis l'extérieur.
+`(4)` On **remplace** `sys.stdout`/`sys.stderr` par des `_Tee` → tout ce qui est
+imprimé va **à la fois** à l'écran et dans `train.log`.
+`(5)`-`(6)` On imprime un en-tête et **tous les args** (`vars(args)` = dict des
+arguments) → trace exacte de la config du run.
+
+```python
+# === extrait réel : train_gmic.py (data + metadonnees) ===
+    train_loader, val_loader, train_samples, val_samples = make_loaders(     # (1)
+        pkl_path=args.pkl, image_dir=args.image_dir,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+        train_frac=args.train_frac, abstain_frac=args.abstain_frac,
+        val_frac=args.val_frac, seed=args.seed, augment=not args.gpu_augment, # (2)
+        input_size=INPUT_SIZE,
+        split_out=os.path.join(args.out, "split_patients.json"))
+    gpu_aug = GPUAugment(input_size=INPUT_SIZE).to(device) if args.gpu_augment else None  # (3)
+
+    import imageio.v2 as _imageio                                            # (4)
+    pixel_depth = str(np.asarray(_imageio.imread(train_samples[0]["path"])).dtype)
+    print(f"[data] profondeur du cache {args.image_dir} : {pixel_depth}")
+```
+
+`(1)` `make_loaders(...)` (cf. §4.4) renvoie les 2 loaders + les **listes
+d'échantillons** train/val (ces dernières nourrissent l'agrégation par sein de
+`evaluate`).
+`(2)` `augment=not args.gpu_augment` : **subtil mais important**. Si l'augmentation
+GPU est active, on **désactive** l'augmentation CPU du dataset (sinon on
+augmenterait deux fois). Les workers CPU ne font alors plus que décoder.
+`(3)` `gpu_aug = GPUAugment(...).to(device) if args.gpu_augment else None` : on
+instancie le module d'augmentation GPU **seulement** si demandé, et on le déplace
+sur le GPU.
+`(4)` On lit **une** image pour détecter la **profondeur du cache** (`uint8` 8 bits
+vs `uint16` 12 bits) — purement informatif (log + métadonnées), la vraie détection
+pour le chemin frugal est dans le dataset (§4.3-4.4).
+
+Suit un gros dict `meta` (cible, agrégation, archi, split, n_train/n_val,
+hyperparams, commit git, description loss/sampler/augmentation…) écrit dans
+`args.json` (vérité machine) et un `README.md` humain via `write_args_json` /
+`write_run_readme`. C'est de la **traçabilité de run** : chaque run est
+auto-documenté. On ne le détaille pas ligne à ligne (ce sont des chaînes
+descriptives), mais on retient : `n_positive_train`/`n_positive_val` comptent les
+**malignant**, et `sampler` documente le WeightedRandomSampler ~50/50.
+
+## 3.7 `main` (suite) — modèle, optimiseur, scheduler, AMP
+
+```python
+# === extrait réel : train_gmic.py ===
+    params = default_parameters(percent_t=args.percent_t, gpu_number=0, dropout=args.dropout)  # (1)
+    model = build_gmic(args.weights, params, device)                         # (2)
+    if args.freeze_backbone:                                                 # (3)
+        freeze_backbone(model)
+    optimizer = torch.optim.Adam(                                            # (4)
+        param_groups(model, args.lr_backbone, args.lr_head),
+        weight_decay=args.weight_decay)
+    warmup_iters = max(1, args.warmup_epochs)                                # (5)
+    warmup = torch.optim.lr_scheduler.LinearLR(                              # (6)
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_iters)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(                     # (7)
+        optimizer, T_max=max(1, args.epochs - warmup_iters))
+    scheduler = torch.optim.lr_scheduler.SequentialLR(                       # (8)
+        optimizer, [warmup, cosine], milestones=[warmup_iters])
+    scaler = GradScaler("cuda", enabled=use_amp)                             # (9)
+```
+
+`(1)` On fabrique les hyperparams d'archi (avec le `percent_t` et le `dropout` CLI).
+`(2)` `build_gmic(...)` construit le modèle + charge les poids NYU (§2.5).
+`(3)` `if args.freeze_backbone: freeze_backbone(model)` : on **gèle AVANT** de
+créer l'optimiseur, pour que `param_groups` voie déjà `requires_grad=False` et
+n'inscrive jamais le backbone. **L'ordre est critique.**
+`(4)` `torch.optim.Adam(param_groups(...), weight_decay=...)` : Adam avec les **deux
+groupes** (LR discriminatif). `weight_decay` = régularisation L2 sur tous les
+poids entraînés.
+`(5)` `warmup_iters = max(1, args.warmup_epochs)` : au moins 1 epoch de warmup.
+`(6)` `LinearLR(start_factor=0.01, end_factor=1.0, total_iters=warmup_iters)` : le
+**warmup** — monte le LR de **1 %** à **100 %** linéairement sur `warmup_iters`
+epochs. Évite les gros pas instables au tout début (poids tête fraîchement init).
+`(7)` `CosineAnnealingLR(T_max=epochs - warmup_iters)` : après le warmup, le LR
+**redescend en cosinus** jusqu'à ~0 sur les epochs restantes — décroissance douce
+classique.
+`(8)` `SequentialLR([warmup, cosine], milestones=[warmup_iters])` : **enchaîne** les
+deux schedulers — warmup jusqu'à l'epoch `warmup_iters`, puis cosine.
+`(9)` `GradScaler("cuda", enabled=use_amp)` : gère la mixed precision en
+**multipliant la loss** par un facteur d'échelle avant le backward (évite que les
+petits gradients fp16 ne *sous-débordent* à 0), puis dé-scale avant le step.
+
+```python
+# === extrait réel : train_gmic.py (etat + resume) ===
+    logs = []; best_auc = -1.0; best_epoch = None                            # (1)
+    early_stopped = False; epochs_no_improve = 0; start_epoch = 0
+    ckpt_last = os.path.join(args.out, "last.pt")                            # (2)
+    ckpt_best = os.path.join(args.out, "best.pt")
+    logs_path = os.path.join(args.out, "logs.json")
+    if args.resume and os.path.exists(ckpt_last):                            # (3)
+        ck = torch.load(ckpt_last, map_location=device)
+        model.load_state_dict(ck["model"])                                   # (4)
+        optimizer.load_state_dict(ck["optimizer"])
+        scheduler.load_state_dict(ck["scheduler"])
+        scaler.load_state_dict(ck["scaler"])
+        best_auc = ck.get("best_auc", -1.0)                                  # (5)
+        logs = ck.get("logs", [])
+        start_epoch = ck["epoch"] + 1                                        # (6)
+        print(f"[resume] reprise a l'epoch {start_epoch} (best_auc={best_auc:.4f})")
+```
+
+`(1)` état de suivi : `best_auc=-1.0` (jamais atteint), `epochs_no_improve` (compteur
+patience), `start_epoch=0`.
+`(2)` chemins des deux checkpoints (`last.pt` reprise, `best.pt` meilleur) + le json
+des logs.
+`(3)` si `--resume` **et** un `last.pt` existe, on recharge tout.
+`(4)` on restaure modèle + optimiseur + scheduler + scaler (état **exact**).
+`(5)` on récupère `best_auc` et `logs` (`.get` avec défaut, robuste aux vieux ckpts).
+`(6)` `start_epoch = ck["epoch"] + 1` : on reprend à l'epoch **suivante**.
+
+```python
+# === extrait réel : train_gmic.py (la boucle d'entrainement) ===
+    for epoch in range(start_epoch, args.epochs):                            # (1)
+        model.train()                                                        # (2)
+        if args.freeze_backbone:
+            set_backbone_eval(model)                                         # (3)
+        t0 = time.time()
+        agg = {"loss": 0.0, "bce_fusion": 0.0, "bce_global": 0.0,            # (4)
+               "bce_local": 0.0, "l1_saliency": 0.0}
+        nb = 0
+        for x, y in train_loader:                                            # (5)
+            x = x.to(device, non_blocking=True).float()                     # (6)
+            if gpu_aug is not None:
+                x = gpu_aug(x)                                               # (7)
+            x = gpu_standardize(x)                                           # (8)
+            yt = y.to(device)                                               # (9)
+            optimizer.zero_grad(set_to_none=True)                           # (10)
+            with autocast("cuda", enabled=use_amp):                         # (11)
+                yf, yg, yl, sal = model(x)
+            total, parts = compute_loss(yf, yg, yl, sal, yt, args.beta)     # (12)
+            scaler.scale(total).backward()                                  # (13)
+            if args.grad_clip > 0:                                          # (14)
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)                                          # (15)
+            scaler.update()                                                 # (16)
+            for k in agg:
+                agg[k] += parts[k]                                          # (17)
+            nb += 1
+        scheduler.step()                                                    # (18)
+        for k in agg:
+            agg[k] /= max(nb, 1)                                            # (19)
+```
+
+`(1)` boucle sur les epochs `[start_epoch, epochs)`.
+`(2)` `model.train()` : mode entraînement (BN à jour, dropout actif, `self.training=True`
+→ rotation des patchs dans le forward).
+`(3)` `set_backbone_eval(model)` : **re-fige la BN du backbone APRÈS `train()`**
+(qui l'avait ré-activée). Le piège n°2, refermé à chaque epoch.
+`(4)` `agg` : accumulateur des composantes de loss pour la moyenne d'epoch ; `nb`
+compte les batches.
+`(5)` boucle sur les batches du `train_loader` (échantillonné par le
+WeightedRandomSampler).
+`(6)` `x.to(device, non_blocking=True).float()` :
+- `.to(device)` : transfert CPU→GPU ;
+- `non_blocking=True` : transfert asynchrone (ne bloque pas le CPU ; effectif si la
+  mémoire source est *pinned* — d'où le `pin_memory` du loader 8 bits, §4.4) ;
+- `.float()` : convertit uint8/int16 → fp32 (l'augmentation et le z-score
+  travaillent en flottant).
+`(7)` `if gpu_aug is not None: x = gpu_aug(x)` : augmentation GPU **seulement si**
+`--gpu-augment` (et uniquement à l'entraînement — `gpu_aug` n'est jamais appelé
+dans `evaluate`).
+`(8)` `gpu_standardize(x)` : z-score par image (toujours, train comme éval).
+`(9)` `yt = y.to(device)` : les labels sur GPU.
+`(10)` `optimizer.zero_grad(set_to_none=True)` : remet les gradients à zéro.
+`set_to_none=True` les met à `None` plutôt que des tenseurs de zéros → un peu plus
+rapide et économe en mémoire.
+`(11)` `with autocast("cuda", enabled=use_amp):` : le forward tourne en **fp16**
+(mixed precision) → plus rapide, moins de VRAM. **Seul le forward** est dans le
+contexte.
+`(12)` `compute_loss(...)` : appelé **hors** du `with autocast` → la BCE se calcule
+en fp32 (cf. `.float()` du §3.1). C'est la résolution concrète du piège n°2.
+`(13)` `scaler.scale(total).backward()` : on **scale** la loss (×facteur) puis
+backward → les gradients fp16 sont scalés vers le haut, évitant l'underflow.
+`(14)` `if args.grad_clip > 0:` — clipping de gradient. `scaler.unscale_(optimizer)`
+**dé-scale** d'abord les gradients (pour clipper sur les vraies valeurs), puis
+`clip_grad_norm_(model.parameters(), grad_clip)` borne leur **norme globale**.
+`(15)` `scaler.step(optimizer)` : applique le pas Adam (saute le step si des inf/NaN
+sont détectés dans les gradients). Ne met à jour que les params **entraînables**
+(le backbone gelé est absent des groupes).
+`(16)` `scaler.update()` : ajuste le facteur d'échelle pour le prochain batch
+(l'augmente si tout va bien, le réduit en cas d'overflow).
+`(17)` on accumule les composantes de loss (valeurs déjà `float`).
+`(18)` `scheduler.step()` : avance le LR (warmup puis cosine), **une fois par
+epoch** (donc après la boucle de batches).
+`(19)` on **moyenne** les composantes de loss sur les `nb` batches.
+
+```python
+# === extrait réel : train_gmic.py (eval, log, checkpoint, early-stopping) ===
+        metrics = evaluate(model, val_loader, val_samples, device, args.beta)  # (1)
+        dt = time.time() - t0
+        lr_now = optimizer.param_groups[0]["lr"]                            # (2)
+        entry = {"epoch": epoch, "time_s": round(dt, 1), "lr_backbone": lr_now,
+                 **{f"train_{k}": round(v, 5) for k, v in agg.items()},     # (3)
+                 **{k: (round(v, 5) if v == v else None) for k, v in metrics.items()}}  # (4)
+        logs.append(entry)
+        with open(logs_path, "w") as f:
+            json.dump(logs, f, indent=2)                                    # (5)
+        print(f"[epoch {epoch:03d}] ... EXAM AUC_mal={metrics['exam_auc_malignant']:.4f} ...")  # (6)
+        print(f"           [tetes] EXAM AUC_mal  fusion=... global=... local=... | train BCE ...")
+        save_ckpt(ckpt_last, epoch, model, optimizer, scheduler, scaler, best_auc, logs)  # (7)
+        auc_m = metrics["exam_auc_malignant"]                               # (8)
+        if auc_m == auc_m and auc_m > best_auc + args.min_delta:            # (9)
+            best_auc = auc_m; best_epoch = epoch; epochs_no_improve = 0     # (10)
+            save_ckpt(ckpt_best, epoch, model, optimizer, scheduler, scaler, best_auc, logs)
+            print(f"           -> nouveau best EXAM AUC_mal={best_auc:.4f} (sauve dans best.pt)")
+        else:
+            epochs_no_improve += 1                                          # (11)
+            print(f"           pas d'amelioration ({epochs_no_improve}/{args.patience}) ...")
+            if epochs_no_improve >= args.patience:                          # (12)
+                early_stopped = True
+                print(f"[early stopping] arret a l'epoch {epoch} ...")
+                break
+```
+
+`(1)` `evaluate(...)` (cf. §3.4) → le dict de métriques, dont l'AUC par sein.
+`(2)` `optimizer.param_groups[0]["lr"]` : le LR **courant** du 1er groupe (log).
+`(3)` `**{f"train_{k}": round(v,5) ...}` : déballe les composantes de loss
+moyennées, préfixées `train_` (`train_loss`, `train_bce_fusion`…).
+`(4)` `**{k: (round(v,5) if v == v else None) ...}` : déballe les métriques. **Le
+`if v == v`** est le test **« n'est pas NaN »** (NaN ≠ NaN en flottant !). Les AUC
+non calculables (une seule classe) sont stockées `None` dans le json (propre).
+`(5)` on **réécrit** `logs.json` à chaque epoch (snapshot complet, robuste au crash).
+`(6)` deux lignes de log lisibles : la principale (val_loss + AUC vue + AUC sein) et
+la ligne `[têtes]` (AUC sein par tête fusion/global/local + BCE train par tête).
+`(7)` `save_ckpt(ckpt_last, ...)` : sauve `last.pt` **à chaque epoch** (reprise).
+`(8)` `auc_m = metrics["exam_auc_malignant"]` : **la métrique de sélection — l'AUC
+malignant PAR SEIN**.
+`(9)` `if auc_m == auc_m and auc_m > best_auc + args.min_delta:` — amélioration
+**réelle** : pas NaN (`auc_m == auc_m`) **et** strictement meilleure que le record
+**plus** `min_delta` (filtre le bruit).
+`(10)` on met à jour le record, **reset** le compteur de patience, et on sauve
+`best.pt`.
+`(11)` sinon, on **incrémente** `epochs_no_improve`.
+`(12)` `if epochs_no_improve >= args.patience:` → **early stopping** : on coupe la
+boucle (`break`). C'est ce qui fait que l'entraînement s'arrête souvent bien avant
+`--epochs`.
+
+```python
+# === extrait réel : train_gmic.py (README final) ===
+    total_s = time.time() - t_run0                                           # (1)
+    meta.update({                                                            # (2)
+        "ended_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "best_auc": best_auc if best_auc > 0 else None,
+        "best_epoch": best_epoch, "epochs_ran": len(logs),
+        "early_stopped": early_stopped,
+        "total_time_human": format_duration(total_s), "total_time_s": round(total_s, 1)})
+    write_args_json(run_dir, meta); write_run_readme(run_dir, meta)          # (3)
+    print(f"Termine. Best EXAM AUC malignant (par sein) = {best_auc:.4f} ...")
+
+if __name__ == "__main__":                                                   # (4)
+    main()
+```
+
+`(1)` durée totale du run.
+`(2)` on **complète** `meta` avec les résultats (heure de fin, best AUC + epoch, nb
+d'epochs réellement courues, si early-stop, durée).
+`(3)` on **réécrit** `args.json` + `README.md` (maintenant avec les résultats) →
+le dossier de run est entièrement auto-documenté.
+`(4)` `if __name__ == "__main__": main()` : point d'entrée standard (lance `main`
+seulement si le fichier est exécuté directement, pas s'il est importé).
+
+---
+
+# 4. `dataset_gmic.py` — le dataset intégral
+
+## 4.0 Docstring, imports, constantes
+
+```python
+# === extrait réel : dataset_gmic.py ===
+import os, pickle                                                            # (1)
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler      # (2)
+from sklearn.model_selection import train_test_split                        # (3)
+import imageio.v2 as imageio                                                 # (4)
+
+VIEWS = ["L-CC", "L-MLO", "R-CC", "R-MLO"]                                   # (5)
+INPUT_SIZE = (2944, 1920)  # (H, W)                                          # (6)
+
+def _side(view):                                                            # (7)
+    return "left" if view.startswith("L") else "right"
+
+def _exam_pid(exam):                                                        # (8)
+    for v in VIEWS:
+        fs = exam.get(v) or []
+        if fs:
+            return fs[0].split("/")[0]
+    return None
+```
+
+`(1)` `pickle` pour lire `data.pkl`, `os` pour les chemins.
+`(2)` les briques DataLoader + le **WeightedRandomSampler** (équilibrage des
+classes).
+`(3)` `train_test_split` de sklearn (split **stratifié**).
+`(4)` `imageio.v2` pour lire les PNG (préserve le dtype natif uint8/uint16).
+`(5)` `VIEWS` : les **4 vues** d'une mammographie (Left/Right × CC/MLO).
+`(6)` `INPUT_SIZE = (2944, 1920)` en `(H, W)` — la taille d'entrée GMIC.
+`(7)` `_side(view)` : « left » si la vue commence par `L`, sinon « right ». C'est
+la fonction qui regroupe CC+MLO d'un même côté (réutilisée dans `evaluate`).
+`(8)` `_exam_pid(exam)` : extrait l'**ID patient** d'un exam. Il prend la première
+vue non vide, le premier fichier, et garde la partie avant le premier `/`
+(convention de chemin `pid/...`). `or []` gère les vues absentes (None).
+
+## 4.1 `build_samples` — aplatir les exams en échantillons par vue
+
+GMIC traite **une vue à la fois** → l'unité du dataset est la **vue**, pas l'exam.
+
+```python
+# === extrait réel : dataset_gmic.py ===
+def build_samples(exam_list, image_dir):                                     # (1)
+    samples = []
+    for exam in exam_list:                                                   # (2)
+        cl = exam["cancer_label"]                                            # (3)
+        pid = _exam_pid(exam)
+        for v in VIEWS:                                                      # (4)
+            fs = exam.get(v) or []
+            if not fs:
+                continue                                                     # (5)
+            path = os.path.join(image_dir, fs[0] + ".png")                   # (6)
+            if not os.path.exists(path):
+                continue                                                     # (7)
+            side = _side(v)                                                  # (8)
+            ben = int(cl.get(f"{side}_benign", 0))                           # (9)
+            mal = int(cl.get(f"{side}_malignant", 0))
+            samples.append({                                                 # (10)
+                "path": path, "view": v, "pid": pid,
+                "label": np.array([ben, mal], dtype=np.float32),             # (11)
+                "malignant": mal,
+            })
+    return samples
+```
+
+`(1)` prend une liste d'exams + le dossier d'images, renvoie une liste plate.
+`(2)` boucle sur chaque exam.
+`(3)` `cl = exam["cancer_label"]` : le dict des labels (par côté) ; `pid` = patient.
+`(4)` boucle sur les **4 vues** possibles.
+`(5)` `if not fs: continue` : si la vue n'existe pas pour cet exam, on saute.
+`(6)` `path = ...fs[0] + ".png"` : chemin du PNG croppé (premier fichier de la vue).
+`(7)` `if not os.path.exists(path): continue` : on **ignore les fichiers manquants**
+(robustesse — un exam référencé mais sans image décodée).
+`(8)`-`(9)` On lit le label **du bon côté** : `{side}_benign` / `{side}_malignant`
+(ex. `left_malignant`). `.get(..., 0)` → 0 si absent. `int(...)` → 0/1.
+`(10)`-`(11)` On crée un **échantillon** : chemin, vue, pid, label `[benign,
+malignant]` en float32 (pour la BCE), et `malignant` à part (pour les stats /
+sampler). Noter l'ordre `[ben, mal]` : c'est lui qui fixe `[:, 0]=benign`,
+`[:, 1]=malignant` partout ailleurs.
+
+## 4.2 `load_and_split3` — split patient en 3 (train/abstain/val)
+
+Le split est **au niveau patient** (pas vue) pour éviter toute **fuite** : deux
+vues d'un même patient ne doivent jamais se retrouver de part et d'autre de
+train/val. Trois ensembles **disjoints** : train, abstention (held-out pour un
+modèle d'abstention futur), val.
+
+```python
+# === extrait réel : dataset_gmic.py ===
+def load_and_split3(pkl_path, train_frac=2.0/3, abstain_frac=1.0/6, val_frac=1.0/6, seed=42):  # (1)
+    with open(pkl_path, "rb") as f:
+        exams = pickle.load(f)                                               # (2)
+    pid_label = {}                                                           # (3)
+    for e in exams:
+        pid = _exam_pid(e)
+        if pid is None:
+            continue
+        m = int(e["cancer_label"].get("malignant", 0))                       # (4)
+        pid_label[pid] = max(pid_label.get(pid, 0), m)                       # (5)
+    uniq = sorted(pid_label.keys())                                          # (6)
+    labels = [pid_label[p] for p in uniq]
+    def _can_strat(lbls):                                                    # (7)
+        npos = sum(lbls)
+        return npos >= 2 and (len(lbls) - npos) >= 2
+```
+
+`(1)` fractions par défaut 2/3, 1/6, 1/6 + seed.
+`(2)` charge la liste d'exams depuis le pickle.
+`(3)` `pid_label` : pour chaque patient, **a-t-il un cancer malignant ?** (pour
+stratifier le split).
+`(4)` `m = ...get("malignant", 0)` : label malignant **au niveau exam** (tous côtés
+confondus).
+`(5)` `max(pid_label.get(pid, 0), m)` : un patient est marqué « positif » si **au
+moins un** de ses exams est malignant.
+`(6)` `uniq` : patients triés (déterminisme), `labels` : leur label dans le même
+ordre.
+`(7)` `_can_strat` : la stratification n'est possible que s'il y a **≥2** positifs
+**et** **≥2** négatifs (sinon `train_test_split` plante). Garde-fou.
+
+```python
+# === extrait réel : dataset_gmic.py (les deux splits) ===
+    rest_pids, val_pids = train_test_split(                                  # (1)
+        uniq, test_size=val_frac,
+        stratify=labels if _can_strat(labels) else None, random_state=seed)
+    if abstain_frac <= 0:                                                    # (2)
+        train_pids, abstain_pids = list(rest_pids), []
+    else:
+        rest_labels = [pid_label[p] for p in rest_pids]                      # (3)
+        train_size_rel = train_frac / (1.0 - val_frac)                       # (4)
+        train_pids, abstain_pids = train_test_split(                         # (5)
+            rest_pids, train_size=train_size_rel,
+            stratify=rest_labels if _can_strat(rest_labels) else None, random_state=seed)
+    train_set, abstain_set, val_set = set(train_pids), set(abstain_pids), set(val_pids)  # (6)
+    train_ex = [e for e in exams if _exam_pid(e) in train_set]               # (7)
+    abstain_ex = [e for e in exams if _exam_pid(e) in abstain_set]
+    val_ex = [e for e in exams if _exam_pid(e) in val_set]
+    split_pids = {"train": sorted(train_set), "abstain": sorted(abstain_set),
+                  "val": sorted(val_set)}
+    return train_ex, abstain_ex, val_ex, split_pids                          # (8)
+```
+
+`(1)` **Étape 1** : on extrait d'abord la **validation** (`test_size=val_frac`),
+stratifiée si possible, avec le seed → `val_pids` + le reste `rest_pids`.
+`(2)` **cas `abstain_frac <= 0`** : pas de held-out d'abstention, **tout le reste**
+part en train. Astuce de comparabilité : la val (extraite en 1) ne dépend que de
+`val_frac`+seed → elle reste **identique** aux runs avec abstention.
+`(3)`-`(4)` Sinon, on calcule la part de train **relative au reste** :
+`train_frac / (1 - val_frac)` (car on veut `train_frac` du **total**, pas du reste).
+`(5)` **Étape 2** : on coupe le reste en train/abstain, stratifié.
+`(6)` on convertit en `set` (recherche O(1)).
+`(7)` on **reconstitue les listes d'exams** par appartenance du pid à chaque set.
+`(8)` on renvoie les 3 listes d'exams + le dict des pids (sauvé en json pour que le
+modèle d'abstention réutilise **exactement** les mêmes ensembles).
+
+## 4.3 `GMICViewDataset` — lecture, augmentation CPU, détection 16 bits
+
+```python
+# === extrait réel : dataset_gmic.py ===
+class GMICViewDataset(Dataset):                                              # (1)
+    def __init__(self, samples, augment=False, input_size=INPUT_SIZE,
+                 max_shift=(48, 32), to_uint8=False):
+        self.samples = samples
+        self.augment = augment                                              # (2)
+        self.input_size = input_size
+        self.max_shift = max_shift                                          # (3)
+        self.to_uint8 = to_uint8                                            # (4)
+        self.bit16 = False                                                  # (5)
+        if samples:
+            im0 = np.asarray(imageio.imread(samples[0]["path"]))            # (6)
+            self.bit16 = im0.dtype == np.uint16
+    def __len__(self):
+        return len(self.samples)                                            # (7)
+```
+
+`(1)` hérite de `torch.utils.data.Dataset` (interface `__len__` + `__getitem__`).
+`(2)` `augment` : applique-t-on l'augmentation CPU ? (True pour train **sans**
+gpu-augment).
+`(3)` `max_shift=(48, 32)` : translation max `(dy, dx)` en pixels pour l'affine.
+`(4)` `to_uint8` : si True, on transfère en **dtype compact** (uint8/int16) et on
+reporte la normalisation z-score sur le GPU (chemin « frugal » mémoire).
+`(5)`-`(6)` **Détection de la profondeur du cache** : on lit la 1re image ; si son
+dtype est `uint16` → `self.bit16 = True`. Cette détection pilote le chemin frugal
+du loader (§4.4) et le cast dans `__getitem__`.
+`(7)` `__len__` : nombre d'échantillons.
+
+```python
+# === extrait réel : dataset_gmic.py / _load ===
+    def _load(self, path):                                                   # (1)
+        im = np.asarray(imageio.imread(path), dtype=np.float32)              # (2)
+        if im.shape != self.input_size:                                      # (3)
+            import cv2
+            im = cv2.resize(im, (self.input_size[1], self.input_size[0]),    # (4)
+                            interpolation=cv2.INTER_CUBIC)
+        return im
+```
+
+`(1)`-`(2)` `_load` : lit le PNG et le convertit en **float32** (pour
+augmentation/resize). imageio préserve les valeurs natives (0–255 ou 0–4095).
+`(3)` `if im.shape != self.input_size:` : si l'image n'est pas déjà à la bonne
+taille (les PNG croppés le sont normalement déjà).
+`(4)` `cv2.resize(im, (W, H), INTER_CUBIC)` : redimensionne. **Attention à
+l'ordre** : cv2 attend `(largeur, hauteur)` d'où `(input_size[1], input_size[0])`.
+`INTER_CUBIC` = interpolation bicubique (qualité).
+
+```python
+# === extrait réel : dataset_gmic.py / _augment ===
+    def _augment(self, im):                                                  # (1)
+        import cv2
+        H, W = im.shape
+        ang = np.random.uniform(-15.0, 15.0)                                 # (2)
+        scale = np.random.uniform(0.9, 1.1)
+        mh, mw = self.max_shift
+        dy = np.random.uniform(-mh, mh); dx = np.random.uniform(-mw, mw)     # (3)
+        M = cv2.getRotationMatrix2D((W/2.0, H/2.0), ang, scale)              # (4)
+        M[0, 2] += dx; M[1, 2] += dy                                         # (5)
+        im = cv2.warpAffine(im, M, (W, H), flags=cv2.INTER_LINEAR,           # (6)
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+        if np.random.rand() < 0.5:                                           # (7)
+            gamma = np.random.uniform(0.8, 1.25)
+            vr = float(im.max())                                             # (8)
+            if vr > 0:
+                im = vr * np.power(np.clip(im, 0.0, vr) / vr, gamma)         # (9)
+        return im
+```
+
+C'est l'**équivalent CPU** de `GPUAugment` (mêmes transformations).
+`(1)` augmentation CPU, utilisée quand `augment=True` (train sans `--gpu-augment`).
+`(2)`-`(3)` tirages aléatoires : rotation ±15°, scale 0.9–1.1, translations dy/dx
+bornées par `max_shift`.
+`(4)` `getRotationMatrix2D((W/2,H/2), ang, scale)` : la matrice 2×3 de rotation +
+scale **autour du centre**.
+`(5)` `M[0,2] += dx; M[1,2] += dy` : on **ajoute la translation** aux termes
+d'offset de la matrice → une seule affine combine rotation+scale+translation.
+`(6)` `cv2.warpAffine(..., BORDER_CONSTANT, borderValue=0.0)` : applique l'affine,
+**fond noir** (`0.0` = fond du crop mammo). Pas de hflip (vues normalisées).
+`(7)` `if np.random.rand() < 0.5:` : gamma **une fois sur deux**.
+`(8)` `vr = im.max()` : le **max de l'image** (gamma scale-aware comme en GPU).
+`(9)` `vr * (clip(im,0,vr)/vr) ** gamma` : applique le gamma sur l'image normalisée
+par son max, puis remet à l'échelle. Non linéaire → survit au z-score.
+
+```python
+# === extrait réel : dataset_gmic.py / __getitem__ ===
+    def __getitem__(self, idx):                                              # (1)
+        s = self.samples[idx]
+        im = self._load(s["path"])                                          # (2)
+        if self.augment:
+            im = self._augment(im)                                          # (3)
+        if self.to_uint8:                                                   # (4)
+            if self.bit16:                                                  # (5)
+                img = torch.from_numpy(np.ascontiguousarray(
+                    np.clip(im, 0.0, 32767.0).astype(np.int16))).unsqueeze(0)  # (6)
+            else:
+                img = torch.from_numpy(np.ascontiguousarray(im.astype(np.uint8))).unsqueeze(0)  # (7)
+        else:
+            im = im - im.mean()                                             # (8)
+            im = im / max(im.std(), 1e-5)
+            img = torch.from_numpy(np.ascontiguousarray(im)).unsqueeze(0)   # (9)
+        label = torch.from_numpy(s["label"])                                # (10)
+        return img, label
+```
+
+`(1)` retourne `(image_tensor, label_tensor)` pour un index.
+`(2)`-`(3)` charge l'image, l'augmente si demandé.
+`(4)` `if self.to_uint8:` — le **chemin compact** (transfert d'un dtype léger,
+z-score reporté sur GPU). C'est ce chemin qui est utilisé (`to_uint8=True` par
+défaut dans `make_loaders`).
+`(5)`-`(6)` **cas 16 bits** : torch **n'a pas d'`uint16`** → on passe par **`int16`**
+(valeurs natives 12 bits ≤ 4095, qui tiennent largement dans `int16` ≤ 32767, d'où
+le `clip(im, 0, 32767)`). `np.ascontiguousarray` garantit un buffer mémoire
+contigu (sinon `torch.from_numpy` peut refuser). `.unsqueeze(0)` ajoute la dim
+canal → `(1, H, W)`.
+`(7)` **cas 8 bits** : simple cast `uint8`.
+`(8)`-`(9)` **chemin non-compact** (si `to_uint8=False`) : on fait le **z-score sur
+CPU** ici (`(im-mean)/std`). `max(std, 1e-5)` évite la division par 0.
+`(10)` `label` : le tenseur `[benign, malignant]`. On renvoie `(img, label)`.
+
+> **Footgun OOM-RAM (le piège n°3).** Transférer du **float32** full-res
+> (2944×1920×4 octets ≈ 22 Mo/image) avec `pin_memory` + plusieurs workers +
+> prefetch sature les **94 Go de RAM** de la VM. D'où le cache **compact** (uint8 =
+> 4× moins, int16 = 2× moins) et la normalisation **reportée sur GPU**. Le z-score
+> GPU étant insensible à l'échelle, le résultat numérique est **identique**.
+
+## 4.4 `_make_sampler` et `make_loaders` (le chemin frugal 16 bits)
+
+```python
+# === extrait réel : dataset_gmic.py / _make_sampler ===
+def _make_sampler(samples):                                                  # (1)
+    finding = [int(s["label"][0] > 0 or s["label"][1] > 0) for s in samples] # (2)
+    n_pos = sum(finding); n_neg = len(finding) - n_pos                       # (3)
+    w_pos = 1.0 / n_pos if n_pos else 0.0                                     # (4)
+    w_neg = 1.0 / n_neg if n_neg else 0.0
+    weights = [w_pos if f else w_neg for f in finding]                       # (5)
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)  # (6)
+```
+
+`(1)` construit l'échantillonneur équilibré (recette anti-collapse de l'article).
+`(2)` `finding` : 1 si la vue a **une lésion** (benign **OU** malignant > 0), 0
+sinon. On équilibre « avec lésion » vs « négative ».
+`(3)` `n_pos`/`n_neg` : nombre de vues avec/sans lésion.
+`(4)` `w_pos = 1/n_pos`, `w_neg = 1/n_neg` : poids **inversement proportionnels** à
+l'effectif de chaque classe → chaque classe pèse autant **en tout**.
+`(5)` `weights` : à chaque vue, son poids selon sa classe.
+`(6)` `WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)` :
+tire `len` échantillons **avec remise**, proportionnellement aux poids → ~**50/50**
+lésion/négatif **par epoch**, même si les positifs sont rares. Sans ça, le modèle
+*collapse* (prédit toujours « négatif »).
+
+▶️ **Démo jouet** : un dataset très déséquilibré (5 % positifs) ré-équilibré.
+
+```{python}
+import torch
+from torch.utils.data import WeightedRandomSampler
+labels = [1]*5 + [0]*95          # 5 positifs, 95 negatifs
+n_pos, n_neg = 5, 95
+w = [(1.0/n_pos if y else 1.0/n_neg) for y in labels]
+sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True)
+drawn = [labels[i] for i in sampler]
+print(f"tires positifs : {sum(drawn)} / {len(drawn)}  (~50% malgre 5% dans les donnees)")
+```
+
+```python
+# === extrait réel : dataset_gmic.py / make_loaders ===
+def make_loaders(pkl_path, image_dir, batch_size=4, num_workers=8,
+                 train_frac=2.0/3, abstain_frac=1.0/6, val_frac=1.0/6,
+                 seed=42, augment=True, input_size=INPUT_SIZE, split_out=None,
+                 to_uint8=True):                                             # (1)
+    train_ex, abstain_ex, val_ex, split_pids = load_and_split3(             # (2)
+        pkl_path, train_frac, abstain_frac, val_frac, seed)
+    train_samples = build_samples(train_ex, image_dir)                      # (3)
+    val_samples = build_samples(val_ex, image_dir)
+    abstain_samples = build_samples(abstain_ex, image_dir)
+    def _stats(samples, name):                                              # (4)
+        n = len(samples); npos = sum(s["malignant"] for s in samples)
+        nben = sum(int(s["label"][0]) for s in samples)
+        print(f"{name:9s}: {n} vues | malignant={npos} | benign={nben}")
+    _stats(train_samples, "train"); _stats(abstain_samples, "abstention"); _stats(val_samples, "val")
+```
+
+`(1)` defaults : `to_uint8=True` (chemin compact par défaut).
+`(2)` split patient en 3.
+`(3)` aplatit chaque ensemble d'exams en échantillons par vue (`abstain_samples`
+n'est utilisé que pour les stats, pas de loader ici).
+`(4)` `_stats` imprime un récap par ensemble (nb vues, malignant, benign) — sanity
+check du déséquilibre.
+
+```python
+# === extrait réel : dataset_gmic.py (sauvegarde split + datasets) ===
+    if split_out:                                                           # (1)
+        import json
+        payload = {"seed": seed, "fracs": {...}, "n_patients": {...}, "pids": split_pids}
+        with open(split_out, "w") as f:
+            json.dump(payload, f)
+        print(f"split patient-level (train/abstention/val) -> {split_out}")
+    train_ds = GMICViewDataset(train_samples, augment=augment, input_size=input_size, to_uint8=to_uint8)  # (2)
+    val_ds = GMICViewDataset(val_samples, augment=False, input_size=input_size, to_uint8=to_uint8)        # (3)
+```
+
+`(1)` si `split_out` fourni, on **sauve le split patient** en json (seed, fractions,
+nb patients, pids) → le modèle d'abstention réutilisera **exactement** ces
+ensembles disjoints.
+`(2)` dataset **train** : `augment=augment` (donc augmentation CPU **sauf** si
+`--gpu-augment`, qui passe `augment=False`).
+`(3)` dataset **val** : `augment=False` **toujours** (évaluation déterministe).
+
+```python
+# === extrait réel : dataset_gmic.py (le chemin FRUGAL 16 bits) ===
+    frugal = train_ds.bit16                                                 # (1)
+    loader_kw = dict(num_workers=num_workers, pin_memory=not frugal)        # (2)
+    if num_workers > 0:                                                     # (3)
+        loader_kw.update(prefetch_factor=(1 if frugal else 2), persistent_workers=False)
+    train_loader = DataLoader(                                              # (4)
+        train_ds, batch_size=batch_size, sampler=_make_sampler(train_samples),
+        drop_last=True, **loader_kw)
+    val_loader = DataLoader(                                                # (5)
+        val_ds, batch_size=batch_size, shuffle=False, **loader_kw)
+    return train_loader, val_loader, train_samples, val_samples            # (6)
+```
+
+`(1)` `frugal = train_ds.bit16` : on bascule en **mode frugal** si le cache est en
+16 bits (int16 = 2× les octets de l'uint8 → l'empreinte RAM double).
+`(2)` `pin_memory = not frugal` : en 8 bits on **épingle** la mémoire (transfert
+GPU plus rapide via `non_blocking`) ; en 16 bits on **désépingle** (la mémoire
+page-locked n'est **pas reclaimable** → sur cette VM **sans swap** ça part en
+reclaim/compaction, 88 % sys, GPU affamé, blocage de fait).
+`(3)` `prefetch_factor = 1 if frugal else 2` : en 16 bits on **préfetche moins**
+(1 batch d'avance par worker) pour borner la RAM ; en 8 bits on garde le chemin
+rapide (2). `persistent_workers=False` : les workers sont recréés à chaque epoch
+(libère la RAM entre epochs).
+`(4)` **train_loader** : `sampler=_make_sampler(...)` (équilibrage — donc **pas**
+de `shuffle`, mutuellement exclusif avec un sampler), `drop_last=True` (jette le
+dernier batch incomplet → tailles régulières, BN stable).
+`(5)` **val_loader** : `shuffle=False` et **pas de `drop_last`** → ordre
+**séquentiel** = ordre du dataset. **C'est l'invariant exigé par l'agrégation par
+sein** (l'assert `len(samples)==len(preds)` de `evaluate`, §3.4).
+`(6)` on renvoie les 2 loaders + les listes train/val (ces dernières alimentent
+l'agrégation par sein).
+
+> **Pourquoi `**loader_kw` partagé ?** Les mêmes options réseau (workers, pin,
+> prefetch) s'appliquent aux deux loaders ; seul ce qui diffère (sampler vs
+> shuffle, drop_last) est passé explicitement. Le **mode frugal est décidé une
+> fois** à partir de la profondeur réelle du cache détectée par le dataset.
+
+---
+
+# 5. Récap : les fils rouges du pipeline
+
+| Concept | Où dans le code | Pourquoi |
+|---|---|---|
+| **3 têtes sigmoïdées** | `GMICTrain.forward` (`torch.sigmoid` + agrég/attention bornées) | sorties déjà des probas |
+| **BCE, pas BCEWithLogits** | `bce` / `compute_loss` | éviter la double-sigmoïde → collapse |
+| **`.float()` hors autocast** | `compute_loss`, `gpu_standardize` | `binary_cross_entropy` pas autocast-safe |
+| **Gel backbone** | `freeze_backbone` (`requires_grad=False` sur `ds_net`/`dn_resnet`) | linear-probe, anti-overfit |
+| **BN figée** | `set_backbone_eval`, ré-appelé après chaque `model.train()` | empêcher la dérive des stats BN |
+| **LR discriminatif** | `param_groups` | backbone lent, tête rapide |
+| **Métrique PER-BREAST** | `evaluate` (agrégation `(pid, side)`) | unité cliniquement étiquetée RSNA |
+| **Sampler ~50/50** | `_make_sampler` (WeightedRandomSampler) | rareté des positifs, anti-collapse |
+| **z-score par image** | `gpu_standardize` / `__getitem__` | normalisation GMIC, annule l'échelle |
+| **Cache compact + frugal** | `__getitem__` (uint8/int16), `make_loaders` (pin/prefetch) | footgun OOM-RAM sur 94 Go sans swap |
+| **AMP** | `autocast` + `GradScaler` | vitesse + VRAM |
+| **warmup + cosine** | `SequentialLR([LinearLR, CosineAnnealingLR])` | départ stable, fin douce |
+| **early-stopping** | boucle `main` sur `exam_auc_malignant` + patience | arrêter au bon moment |
+
+### La recette du pipeline en une phrase
+
+On charge le backbone NYU (`strict=False`), on l'optionnellement gèle (BN figée
+incluse), on entraîne **par vue** avec un sampler équilibré, une augmentation
+(CPU ou GPU) **non linéaire**, une loss BCE×3 + L1 sur sorties **déjà sigmoïdées**,
+en mixed precision avec warmup+cosine ; on **sélectionne et on s'arrête** sur
+l'**AUC malignant agrégée par SEIN** ; et on transfère les images en **dtype
+compact** avec un loader **frugal en 16 bits** pour ne pas faire exploser la RAM.

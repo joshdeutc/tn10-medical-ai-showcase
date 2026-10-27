@@ -1,0 +1,590 @@
+---
+title: "Fine-tuning par gel (linear-probe) de GMIC — de A à Z"
+subtitle: "Du chargement des poids pré-entraînés au lancement de la boucle d'entraînement"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+jupyter: gmic
+---
+
+Ce document explique, étape par étape, le type de fine-tuning où l'on **gèle
+quasiment tout le réseau** et où l'on n'entraîne qu'une fine couche « tête ».
+On suit le pipeline réel du projet RSNA cancer du sein, du **chargement des poids
+pré-entraînés** jusqu'au **lancement de la boucle d'entraînement**.
+
+On mélange deux niveaux :
+
+- 🧠 **la théorie** (pourquoi geler, `requires_grad`, BatchNorm, LR discriminatif…) ;
+- 💻 **le vrai code GMIC** du projet (`fine_tuning/gmic_finetune.py`, `fine_tuning/train_gmic.py`).
+
+Les blocs marqués *« extrait réel »* ne sont pas exécutés (ils dépendent du repo
+GMIC + données + GPU). Les blocs ▶️ **démo jouet** s'exécutent avec juste `torch`
+sur CPU et illustrent le concept en miniature.
+
+---
+
+# 0. Rappel : transfer learning, et pourquoi geler ?
+
+Un réseau pré-entraîné (ici GMIC, entraîné par la NYU sur de grandes bases de
+mammographies) a déjà appris, dans ses couches convolutionnelles, des
+**détecteurs de features** génériques (bords, textures, microcalcifications…).
+Quand on transfère vers un nouveau jeu (RSNA) avec **peu de positifs**, on a trois
+régimes possibles :
+
+| Régime | Ce qu'on entraîne | Quand | Risque |
+|---|---|---|---|
+| **Full fine-tuning** | tout le réseau | beaucoup de données cible | surapprentissage, oubli des features |
+| **Linear-probe / feature-extraction** | seulement la tête | peu de données, features déjà bonnes | sous-apprentissage si domaine trop différent |
+| **Gradual unfreezing** | tête d'abord, puis on dégèle par paliers | compromis | plus de réglages |
+
+**Geler quasiment tout = le régime linear-probe.** Concrètement on :
+
+1. met `requires_grad = False` sur les poids du *backbone* → pas de gradient, pas
+   de mise à jour, et on les exclut de l'optimiseur ;
+2. n'optimise que la **tête** (ici : conv de saliency + attention + fusion) ;
+3. fige aussi les **statistiques de BatchNorm** du backbone (point clé, §4).
+
+**Pourquoi c'est malin sur RSNA :** très peu de cancers → un full fine-tuning de
+~14 M params surapprend vite. En ne touchant qu'à ~0.13 M params (< 1 %), on garde
+les features NYU intactes et on apprend juste à *recombiner* ces features pour les
+classes `benign`/`malignant`. C'est rapide, stable, et anti-overfit.
+
+---
+
+# 1. L'architecture GMIC en une page
+
+GMIC (*Globally-aware Multiple Instance Classifier*) a **deux branches** + une fusion :
+
+```text
+  image full-res (1, 2944, 1920)
+        │
+        ▼
+  ┌─────────────────┐   branche GLOBALE
+  │  ds_net (ResNet)│──► feature map ──► left_postprocess_net (conv 1x1)
+  └─────────────────┘                     │  = saliency maps par classe
+                                          ▼
+                             aggregation top-t%  ──► y_global (proba)
+                                          │
+        ┌─────────────────────────────────┘  (saliency détachée)
+        ▼
+  retrieve_roi_crops : greedy ROI, NON différentiable (numpy) ──► K=6 patchs
+        │
+        ▼
+  ┌─────────────────┐   branche LOCALE
+  │ dn_resnet(R-18) │──► h_crops (K vecteurs)
+  └─────────────────┘        │
+                             ▼
+                   attention_module (MIL) ──► z, y_local (proba)
+                             │
+        global_vec ──────────┤
+                             ▼
+                   fusion_dnn (Linear) ──► sigmoid ──► y_fusion (proba)
+```
+
+**Où vivent les poids (ce qui compte pour le gel) :** les sous-modules sont
+greffés sur le module parent GMIC par `add_layers()`. Les *deux gros extracteurs
+ResNet* sont enregistrés sous les noms **`ds_net`** (global) et **`dn_resnet`**
+(local). Tout le reste (`left_postprocess_net`, `attention_module`, `fusion_dnn`)
+est la **tête** légère. On verra au §4 pourquoi ces noms suffisent à isoler
+proprement le backbone.
+
+---
+
+# 2. Étape 1 — Importer les poids pré-entraînés
+
+On construit le modèle puis on charge le checkpoint NYU avec **`strict=False`**.
+Extrait réel de `gmic_finetune.py` :
+
+```python
+# === extrait réel : gmic_finetune.py ===
+def build_gmic(weights_path, parameters, device):
+    model = GMICTrain(parameters)
+    if weights_path:
+        state = torch.load(weights_path, map_location="cpu", weights_only=False)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[build_gmic] charge {weights_path}")
+        if missing:
+            print(f"  missing keys    ({len(missing)}): {missing}")
+        if unexpected:
+            print(f"  unexpected keys ({len(unexpected)}): {unexpected}")
+    return model.to(device)
+```
+
+### Pourquoi `strict=False` ?
+
+`load_state_dict(strict=True)` (le défaut) **plante** si une seule clé diffère
+entre le checkpoint et le modèle. Or ici on veut tolérer :
+
+- des **clés manquantes** (`missing`) : un paramètre du modèle absent du checkpoint
+  → il **garde son initialisation aléatoire** (typiquement la tête redimensionnée
+  pour nos 2 classes) ;
+- des **clés en trop** (`unexpected`) : présentes dans le checkpoint mais pas dans
+  le modèle → **ignorées**.
+
+C'est exactement ce qu'on veut en transfer learning : **réutiliser le backbone**,
+**réinitialiser** la tête. Le `print` des deux listes est une sécurité : si
+`missing` contenait `ds_net.*`, ça voudrait dire que le backbone n'a **pas** été
+chargé → on s'en apercevrait tout de suite.
+
+▶️ **Démo jouet** : reproduisons le comportement `strict=False` sur un mini-modèle.
+
+```{python}
+import torch, torch.nn as nn
+
+# 'ckpt' : un checkpoint avec backbone 'feat' + biais de tete
+ckpt = {
+    'feat.weight': torch.randn(4, 1), 'feat.bias': torch.randn(4),
+    'head.bias': torch.randn(2),   # on ne fournit PAS head.weight (sera laisse a l'init)
+}
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.feat = nn.Linear(1, 4)   # backbone
+        self.head = nn.Linear(4, 2)   # tete 2 classes : benign/malignant
+    def forward(self, x): return self.head(torch.relu(self.feat(x)))
+
+model = Net()
+missing, unexpected = model.load_state_dict(ckpt, strict=False)
+print('missing    :', missing)     # ['head.weight'] -> garde son init aleatoire
+print('unexpected :', unexpected)  # [] ici
+```
+
+Règle à retenir : `strict=False` tolère les clés **absentes / en trop**, mais
+**pas** les *shapes* incompatibles (ça, ça lève toujours une erreur de taille).
+
+---
+
+# 3. Étape 2 — Le forward d'entraînement (`GMICTrain`)
+
+Le GMIC d'origine renvoie surtout `y_fusion` et garde des buffers de
+visualisation. Pour l'entraînement on sous-classe pour :
+
+- renvoyer **les 3 têtes** `y_fusion, y_global, y_local` + la `saliency_map`
+  (la loss supervise les 3, cf §6) ;
+- éviter les copies CPU inutiles ;
+- ajouter des **augmentations train-only** (rotation des patchs, dropout fusion).
+
+```python
+# === extrait réel : gmic_finetune.py / class GMICTrain(GMIC) ===
+def forward(self, x_original):
+    # --- branche globale ---
+    h_g, self.saliency_map = self.global_network.forward(x_original)
+    self.y_global = self.aggregation_function.forward(self.saliency_map)
+
+    # --- region proposal (NON différentiable, numpy) ---
+    small_x_locations = self.retrieve_roi_crops.forward(
+        x_original, self.cam_size, self.saliency_map)
+    self.patch_locations = self._convert_crop_position(
+        small_x_locations, self.cam_size, x_original)
+
+    # --- extraction des K patchs ---
+    crops_variable = self._retrieve_crop(
+        x_original, self.patch_locations, self.retrieve_roi_crops.crop_method)
+    batch_size, num_crops, I, J = crops_variable.size()
+
+    # --- augmentation papier : rotation aléatoire {0,90,180,270} (TRAIN only) ---
+    if self.training and I == J:
+        ks = torch.randint(0, 4, (batch_size, num_crops))
+        crops_variable = torch.stack([
+            torch.rot90(crops_variable[i, j], int(ks[i, j]), dims=(0, 1))
+            for i in range(batch_size) for j in range(num_crops)
+        ]).view(batch_size, num_crops, I, J)
+
+    crops_variable = crops_variable.view(batch_size * num_crops, I, J).unsqueeze(1)
+
+    # --- branche locale + MIL attention ---
+    h_crops = self.local_network.forward(crops_variable).view(batch_size, num_crops, -1)
+    z, self.patch_attns, self.y_local = self.attention_module.forward(h_crops)
+
+    # --- fusion ---
+    g1, _ = torch.max(h_g, dim=2)
+    global_vec, _ = torch.max(g1, dim=2)
+    concat_vec = torch.cat([global_vec, z], dim=1)
+    p_drop = self.experiment_parameters.get("dropout", 0.0)
+    if p_drop > 0:
+        concat_vec = nn.functional.dropout(concat_vec, p=p_drop, training=self.training)
+    self.y_fusion = torch.sigmoid(self.fusion_dnn(concat_vec))
+    return self.y_fusion, self.y_global, self.y_local, self.saliency_map
+```
+
+Trois points cruciaux pour la suite :
+
+1. **Les sorties sont déjà des probas** (`y_global`/`y_local` sortent d'une
+   agrégation/attention bornée, `y_fusion` passe par `torch.sigmoid`). → la loss
+   sera `binary_cross_entropy`, **jamais** `BCEWithLogits` (§6).
+2. **Le region proposal est non différentiable** : `retrieve_roi_crops` fait une
+   sélection gloutonne en numpy sur la saliency **détachée**. Aucun gradient ne
+   passe par le *choix* des coordonnées des patchs — c'est intrinsèque à GMIC, et
+   ce module n'a de toute façon **aucun poids** (rien à geler).
+3. **`self.training`** pilote les augmentations : c'est le drapeau basculé par
+   `model.train()` / `model.eval()`. On le réutilisera au §4.
+
+---
+
+# 4. Étape 3 — **Geler** le backbone : `freeze_backbone`
+
+Voici le cœur du sujet. L'extrait réel :
+
+```python
+# === extrait réel : gmic_finetune.py ===
+# Noms des sous-modules backbone (greffés sur le parent par add_layers)
+_BACKBONE_PREFIXES = ("ds_net", "dn_resnet")
+
+def freeze_backbone(model):
+    """Linear-probe : gèle les deux backbones (ds_net global + dn_resnet local)."""
+    n = 0
+    for name, p in model.named_parameters():
+        if name.startswith(_BACKBONE_PREFIXES):
+            p.requires_grad = False
+            n += p.numel()
+    print(f"[freeze_backbone] {n/1e6:.2f}M params backbone gelés (requires_grad=False)")
+```
+
+### Que fait `requires_grad = False` ?
+
+Trois effets en chaîne :
+
+1. lors du `backward()`, **aucun gradient n'est calculé** pour ce tenseur
+   (`p.grad` reste `None`) ;
+2. on l'**exclut de l'optimiseur** (cf `param_groups` au §5 : `if not
+   p.requires_grad: continue`) → même un `optimizer.step()` ne le touche pas ;
+3. autograd **n'a plus besoin de stocker** les activations intermédiaires de ces
+   couches → moins de mémoire, forward/backward plus rapides.
+
+### Pourquoi le filtre `startswith(("ds_net","dn_resnet"))` suffit-il ?
+
+C'est LA subtilité GMIC. Les classes `GlobalNetwork`/`LocalNetwork` héritent de
+`AbstractMILUnit`, qui **n'est pas** un `nn.Module`. Donc `self.global_network =
+GlobalNetwork(...)` **n'enregistre rien** dans le GMIC (le `__setattr__` de
+`nn.Module` ignore les objets non-Module). Les ResNet ne sont enregistrés que par
+la greffe `add_layers()` directement sur le parent :
+
+```python
+self.parent_module.ds_net    = self.downsampling_branch   # ResNetV2 global
+self.parent_module.dn_resnet = ResNetV1(...)              # ResNet-18 patchs
+```
+
+→ dans `named_parameters()`, les poids des deux ResNet apparaissent **uniquement**
+sous les préfixes `ds_net.*` et `dn_resnet.*`. Le filtre attrape donc
+**exactement** les deux extracteurs, et rien d'autre (`left_postprocess_net`,
+`attention`, `fusion_dnn` ne matchent pas → restent entraînables).
+
+**Vérifié sur le vrai run** (`gmic_ft_frozen/train.log`) :
+
+```text
+[freeze_backbone] 13.98M params backbone gelés (requires_grad=False)
+[param_groups] backbone=0.00M @ lr=1e-05 | head=0.13M @ lr=0.0001
+```
+
+→ 13.98 M gelés, 0.13 M entraînés : **moins de 1 %** du modèle bouge.
+
+▶️ **Démo jouet** : reproduisons (a) la greffe via un wrapper non-Module et
+(b) le gel par préfixe, pour voir que `named_parameters` ne liste que le nom greffé.
+
+```{python}
+import torch.nn as nn
+
+class NotAModule:                       # <- comme AbstractMILUnit : objet simple
+    def __init__(self, parent):
+        self.parent = parent
+        self.resnet = nn.Linear(8, 8)   # le 'backbone'
+    def graft(self):
+        self.parent.ds_net = self.resnet  # greffe sur le parent (un vrai nn.Module)
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wrapper = NotAModule(self)   # NON enregistré (pas un nn.Module)
+        self.wrapper.graft()              # -> cree self.ds_net
+        self.head = nn.Linear(8, 2)       # la tete
+
+m = Model()
+print('Noms des parametres :')
+for name, p in m.named_parameters():
+    print(f'  {name:18s} requires_grad={p.requires_grad}')
+# -> on ne voit QUE 'ds_net.*' (pas 'wrapper.resnet.*')
+```
+
+```{python}
+# Gel par prefixe, exactement comme freeze_backbone :
+n = 0
+for name, p in m.named_parameters():
+    if name.startswith(('ds_net', 'dn_resnet')):
+        p.requires_grad = False
+        n += p.numel()
+print(f'gelés : {n} params')
+print('entraînables restants :',
+      [name for name, p in m.named_parameters() if p.requires_grad])
+# -> seule la 'head' reste entrainable
+```
+
+---
+
+# 5. Étape 4 — Le piège **BatchNorm** : `set_backbone_eval`
+
+`requires_grad = False` gèle les **poids**… mais **pas** les statistiques de
+BatchNorm ! Une couche BN garde des buffers `running_mean` / `running_var` qui,
+**en mode `train()`**, sont mis à jour à chaque batch — même sans gradient.
+Résultat : un backbone « gelé » verrait quand même ses BN **dériver** vers les
+stats du domaine RSNA, ce qui change ses sorties. On veut figer ça aussi :
+
+```python
+# === extrait réel : gmic_finetune.py ===
+def set_backbone_eval(model):
+    """Met les modules backbone en .eval() (BN -> running stats figées)."""
+    for name, module in model.named_modules():
+        if name.startswith(_BACKBONE_PREFIXES):
+            module.eval()
+```
+
+`.eval()` bascule le drapeau `training=False` de ces modules → la BN utilise ses
+`running_mean/var` **figées** au lieu des stats du batch, et **cesse de les mettre
+à jour**.
+
+### Pourquoi le ré-appeler à **chaque** epoch ?
+
+Dans la boucle (§7), on appelle `model.train()` en tête de chaque epoch. Or
+`model.train()` est **récursif** : il remet *tous* les sous-modules (donc la BN du
+backbone) en mode train. Il faut donc **re-figer** juste après :
+
+```python
+model.train()
+if args.freeze_backbone:
+    set_backbone_eval(model)   # re-fige la BN du backbone APRES train()
+```
+
+▶️ **Démo jouet** : observons `running_mean` dériver en `train()` puis se figer en `eval()`.
+
+```{python}
+import torch, torch.nn as nn
+bn = nn.BatchNorm1d(3)
+print('init running_mean :', bn.running_mean.tolist())
+
+# mode train : la BN met a jour running_mean a chaque passage
+bn.train()
+for _ in range(5):
+    bn(torch.randn(16, 3) + 10.0)   # donnees centrees autour de 10
+print('apres 5 batches train() :', [round(v, 3) for v in bn.running_mean.tolist()])
+
+# mode eval : on fige -> plus aucune mise a jour, meme avec de nouvelles donnees
+bn.eval()
+frozen = bn.running_mean.clone()
+for _ in range(5):
+    bn(torch.randn(16, 3) + 100.0)  # donnees tres differentes
+print('apres 5 batches eval()  :', [round(v, 3) for v in bn.running_mean.tolist()])
+print('inchange ?', torch.allclose(frozen, bn.running_mean))
+```
+
+---
+
+# 6. Étape 5 — Groupes de paramètres & optimiseur (`param_groups`)
+
+Même fonction qu'en full fine-tuning (LR discriminatif backbone bas / tête haut),
+mais c'est ici que le **filtre `requires_grad`** fait basculer le mode gelé :
+
+```python
+# === extrait réel : gmic_finetune.py ===
+def param_groups(model, lr_backbone, lr_head):
+    backbone, head = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:        # <-- en mode gelé, saute tout le backbone
+            continue
+        if name.startswith(_BACKBONE_PREFIXES):
+            backbone.append(p)
+        else:
+            head.append(p)
+    n_bb = sum(p.numel() for p in backbone)
+    n_hd = sum(p.numel() for p in head)
+    print(f"[param_groups] backbone={n_bb/1e6:.2f}M @ lr={lr_backbone} | "
+          f"head={n_hd/1e6:.2f}M @ lr={lr_head}")
+    return [
+        {"params": backbone, "lr": lr_backbone},
+        {"params": head, "lr": lr_head},
+    ]
+```
+
+- **Sans gel** : deux groupes réellement peuplés → `backbone=13.98M @ 1e-5` et
+  `head=0.13M @ 1e-4`. Le backbone bouge lentement, la tête vite.
+- **Avec gel** : `freeze_backbone()` a déjà mis `requires_grad=False` sur le
+  backbone → le `continue` l'élimine → le groupe backbone est **vide**
+  (`backbone=0.00M`). L'optimiseur ne contient plus que la tête. ⚠️ Conséquence :
+  en mode gelé, **`--lr-backbone` ne sert plus à rien**, seul `--lr-head` agit.
+
+Côté `train_gmic.py`, l'enchaînement build → freeze → optimizer :
+
+```python
+# === extrait réel : train_gmic.py ===
+model = build_gmic(args.weights, params, device)
+if args.freeze_backbone:
+    freeze_backbone(model)            # gel AVANT de construire l'optimiseur
+
+optimizer = torch.optim.Adam(
+    param_groups(model, args.lr_backbone, args.lr_head),
+    weight_decay=args.weight_decay,
+)
+```
+
+L'ordre est important : on **gèle avant** de créer l'optimiseur, pour que
+`param_groups` voie déjà `requires_grad=False` et n'inscrive jamais le backbone.
+
+---
+
+# 7. Étape 6 — La loss 3 têtes
+
+La loss de l'article GMIC supervise les **trois** sorties + régularise la saliency :
+
+$$ \mathcal{L} = \mathrm{BCE}(y_{fusion}) + \mathrm{BCE}(y_{global}) + \mathrm{BCE}(y_{local}) + \beta\,\lVert \mathrm{saliency} \rVert_1 $$
+
+```python
+# === extrait réel : train_gmic.py ===
+EPS = 1e-7
+def bce(prob, target):
+    prob = prob.clamp(EPS, 1.0 - EPS)        # évite log(0)
+    return nn.functional.binary_cross_entropy(prob, target)
+
+def compute_loss(y_fusion, y_global, y_local, saliency, target, beta):
+    l_fus = bce(y_fusion.float(), target)    # .float() : on quitte l'autocast (fp16)
+    l_glo = bce(y_global.float(), target)
+    l_loc = bce(y_local.float(), target)
+    l_reg = beta * saliency.float().abs().mean() if beta > 0 else 0.0
+    total = l_fus + l_glo + l_loc + l_reg
+    return total, {...}
+```
+
+Deux pièges déjà rencontrés dans le projet :
+
+1. **`binary_cross_entropy`, PAS `BCEWithLogits`.** Les 3 sorties sont **déjà** des
+   probabilités. `BCEWithLogits` ré-appliquerait une sigmoïde en interne → double
+   sigmoïde → gradients écrasés, modèle qui *collapse*. On `clamp` à `[EPS, 1-EPS]`
+   pour éviter `log(0)`.
+2. **`.float()` hors autocast.** L'entraînement tourne en mixed-precision
+   (`autocast` fp16). Or `binary_cross_entropy` n'est **pas autocast-safe** : on
+   force fp32 en sortant du contexte autocast, sinon NaN/instabilités.
+
+▶️ **Démo jouet** : la double-sigmoïde, illustrée.
+
+```{python}
+import torch, torch.nn.functional as F
+proba = torch.tensor([0.99, 0.01])     # sortie DEJA en proba (apres sigmoid)
+target = torch.tensor([1.0, 0.0])
+
+# CORRECT : BCE sur proba
+good = F.binary_cross_entropy(proba.clamp(1e-7, 1 - 1e-7), target)
+# FAUX : BCEWithLogits traite 'proba' comme un logit -> re-sigmoide
+bad = F.binary_cross_entropy_with_logits(proba, target)
+print(f'BCE(proba) correct       = {good.item():.4f}  (faible : prediction sure et juste)')
+print(f'BCEWithLogits(proba) FAUX = {bad.item():.4f}  (gonflee : 0.99 retraite en sigmoid(0.99)=0.73)')
+```
+
+---
+
+# 8. Étape 7 — La boucle d'entraînement
+
+On assemble tout. Points spécifiques au mode gelé surlignés en commentaire :
+
+```python
+# === extrait réel : train_gmic.py ===
+for epoch in range(start_epoch, args.epochs):
+    model.train()
+    if args.freeze_backbone:
+        set_backbone_eval(model)          # (§4) re-fige la BN du backbone APRES train()
+    for x, y in train_loader:
+        x = gpu_standardize(x.to(device, non_blocking=True))
+        yt = y.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast("cuda", enabled=use_amp):   # mixed precision fp16
+            yf, yg, yl, sal = model(x)
+        # loss en fp32, HORS autocast (§6)
+        total, parts = compute_loss(yf, yg, yl, sal, yt, args.beta)
+        scaler.scale(total).backward()            # backward : gradients SEULEMENT sur la tete
+        if args.grad_clip > 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)                    # step : ne met a jour que la tete
+        scaler.update()
+    scheduler.step()                              # warmup lineaire puis cosine
+    metrics = evaluate(model, val_loader, device, args.beta)  # AUC malignant/benign
+    # ... checkpoint last.pt + best.pt si AUC_mal s'ameliore ...
+```
+
+Ce qui se passe **réellement** quand le backbone est gelé :
+
+- `model(x)` traverse bien tout le réseau (forward complet) — on a besoin des
+  features du backbone pour nourrir la tête ;
+- mais `backward()` ne calcule des gradients **que pour la tête** (le reste a
+  `requires_grad=False`) ;
+- `optimizer.step()` ne met à jour que la tête (backbone absent des param_groups) ;
+- la BN du backbone reste en `eval()` → sorties stables.
+
+Le **scheduler** : `LinearLR` (warmup, ramène le LR de 1 % à 100 % sur
+`warmup_epochs`) puis `CosineAnnealingLR` (décroissance douce). Le **GradScaler**
+gère la mixed precision (scale la loss pour éviter l'underflow des gradients fp16).
+
+---
+
+# 9. Étape 8 — Lancement & lecture des logs
+
+La commande réelle pour lancer le run gelé (sur la VM) :
+
+```bash
+./.venv/bin/python -m fine_tuning.train_gmic \
+    --weights GMIC/models/sample_model_1.p \
+    --freeze-backbone \
+    --percent-t 0.02 --epochs 30 --batch-size 16 \
+    --lr-head 1e-4 \
+    --out fine_tuning/checkpoints/gmic_ft_frozen \
+    2>&1 | tee fine_tuning/checkpoints/gmic_ft_frozen/train.log
+```
+
+**Ce qu'on vérifie dans les premières lignes du log :**
+
+```text
+  freeze_backbone: True                                  # le flag est bien pris
+[build_gmic] charge GMIC/models/sample_model_1.p
+[freeze_backbone] 13.98M params backbone gelés ...       # le backbone EST gelé
+[param_groups] backbone=0.00M @ lr=1e-05 | head=0.13M @ lr=0.0001   # groupe backbone vide
+```
+
+Si `freeze_backbone` affichait `0.00M`, ce serait le signe d'une faute de préfixe
+(le filtre ne matche rien). Ici 13.98 M → tout est cohérent.
+
+**Pendant l'entraînement**, chaque epoch logge `train_loss`, `val_loss`,
+`AUC_mal`, `AUC_ben`. En mode gelé on s'attend à : convergence **rapide** (peu de
+params), courbe **stable** (pas d'oubli du backbone), et un **plafond** d'AUC
+potentiellement plus bas qu'un full fine-tuning si le domaine RSNA diffère trop de
+l'entraînement NYU — c'est le compromis du linear-probe.
+
+---
+
+# 10. Récap : quand geler quoi ?
+
+| | Linear-probe (ce doc) | Full fine-tuning |
+|---|---|---|
+| `requires_grad` backbone | **False** | True |
+| BN backbone | `.eval()` (figée) | `.train()` |
+| params entraînés | tête ~0.13 M (< 1 %) | ~14.1 M (100 %) |
+| `param_groups` | backbone vide, seul `lr_head` agit | 2 groupes, LR discriminatif |
+| vitesse / mémoire | rapide, léger | lent, lourd |
+| risque overfit | faible | élevé (peu de positifs) |
+| plafond de perf | limité par les features figées | plus haut si assez de données |
+
+### La recette de gel en 4 gestes (tout le secret de ce fine-tuning)
+
+1. **Charger** le backbone pré-entraîné (`build_gmic`, `strict=False`).
+2. **Geler** ses poids : `requires_grad=False` sur `ds_net.*` + `dn_resnet.*`
+   (`freeze_backbone`).
+3. **Figer sa BatchNorm** : `.eval()` sur ces modules, **ré-appliqué après chaque**
+   `model.train()` (`set_backbone_eval`).
+4. **N'optimiser que la tête** : le filtre `requires_grad` dans `param_groups` vide
+   automatiquement le groupe backbone.
+
+Le reste (loss 3 têtes, AMP, scheduler, checkpoint) est **identique** au full
+fine-tuning : seuls ces 4 gestes distinguent le régime « on gèle quasiment tout ».
+
+> Étape suivante naturelle : un **gradual unfreezing** — dégeler `dn_resnet` puis
+> `ds_net` par paliers une fois la tête stabilisée, en ré-augmentant `lr_backbone`.
+> Le code le permet déjà (relancer sans `--freeze-backbone`, ou ne dégeler qu'une
+> partie).

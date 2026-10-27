@@ -1,0 +1,330 @@
+---
+title: "The silent failures, one by one"
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+import sys
+sys.path.insert(0, ".")
+import functools
+import re
+from _outils import *          # noqa: F403
+ns = {"re": re}
+for nom in ("MARK", "REDACTION", "protect", "restore"):
+    exec(compile(source_de(nom, PARAGRAPHES), "<traduire_paragraphes>", "exec"), ns)
+protect, restore = ns["protect"], ns["restore"]
+```
+
+This chapter is an inventory. Every problem that follows has one thing in common:
+**none of them raises an error.** The program carries on, produces a plausible output,
+and the fault shows up only when compared against the real text — or not at all.
+
+That is the reason for the checks scattered through the code: version assertions,
+redaction counts, counters of rejected segments, format-quality columns. Each one exists
+because one of these cases got through.
+
+## Overview
+
+| # | what happens | what you observe | what catches it |
+|---|---|---|---|
+| 1 | wrong architecture instantiated | fluent Croatian, unrelated to the source | version assertion, parameter count |
+| 2 | the old splitting rejected short lines | "Croatian" corpus partly English | measuring the translated share |
+| 3 | fixed `max_new_tokens` | end of long texts missing | `budget()` per batch |
+| 4 | right padding in batched generation | plausible but mismatched outputs | `padding_side = "left"` |
+| 5 | unmonitored out-of-memory | run stopped, found 2 h later | recursive re-splitting |
+| 6 | redaction lost in translation | missing data manufactured | `restore`, per-note counter |
+| 7 | `str.count("___")` over-counts | 3 false alarms | knowing how to read the signal |
+| 8 | window too small | an F1 that measures tokenisation | window at 16384, `truncated_notes` |
+| 9 | model that emits no JSON | looks like "always No" | `parse_failed` column |
+| 10 | prescribed wording taken for an invention | the good models accused | `_ABSENCE_PHRASES` |
+| 11 | `ij` as a substring | 21 false matches per note | word boundaries, case sensitivity |
+| 12 | `pgrep -f` matches itself | GPU idle, job never launched | kill by explicit PID |
+| 13 | a "4-bit" repo that is not | 39 GB instead of 19 | sum the file sizes on the Hub |
+| 14 | call sized on the context window | 40 % of every note missing | size on the training length |
+| 15 | model that copies instead of translating | perfect length ratio (0.997) | count the **language** of the output |
+
+## 1. The checkpoint loaded under a different architecture
+
+**Symptom.** HPLT, loaded with `transformers` 5.5.0, produces grammatical and fluent
+Croatian, entirely uncorrelated with the source text. No warning.
+
+**Cause.** The recent library picks a different model class for that configuration file,
+randomly initialises the weights that do not exist in the checkpoint, and generates
+plausible text out of nothing.
+
+**The clue.** One log line: *110 M parameters* instead of 77 M.
+
+**False lead.** Converting the checkpoint to `safetensors` — several hours lost. The
+problem is the architecture instantiated, not the file format.
+
+**Fix.** Pin the version, with an assertion that refuses to continue:
+
+```python
+assert (4, 26) <= (major, minor) <= (4, 30), (
+    f"HPLT requires transformers 4.26-4.30, found {transformers.__version__}")
+```
+
+And always print the parameter count at load time. A version assertion is more useful
+than a comment: it executes.
+
+## 2. The "Croatian" corpus that stayed English {#sec-ancien-decoupage}
+
+**Symptom.** A corpus announced as Croatian, 15.7 % of whose text had stayed in English
+— and not just any part of it.
+
+**Cause.** The first splitting classified lines with a rule along the lines of "at least
+three words of three letters or more". `R IJ placement` contains only one, `placement`:
+the line was therefore rejected and never translated. And that is exactly the shape of
+the lines in the `Major Surgical or Invasive Procedure` section — that is, the place
+where the catheter evidence the whole chain is looking for lives.
+
+The extraction model, whose prompt is in English, was thus reading the most decisive
+clues in their original language.
+
+**What made it invisible.** The corpus *looked* like Croatian — 78.5 % of the text was.
+And the bias ran in the direction of good news: it *improved* the Croatian F1, so
+nothing pushed anyone to look for it.
+
+**Fix, in two steps.** First widen the rule so that anything containing language gets
+translated; then remove that line classification entirely in favour of paragraph
+splitting, which has no rule to tune — see "The paragraph, a universal unit".
+
+**Lesson.** A bias that flatters the result is more dangerous than a bug that degrades
+it. And a rule that needs fine tuning is a rule that will eventually be tuned wrong.
+
+## 3. The silent truncation of generation
+
+**Symptom.** Long segments come back translated, but cut off mid-sentence. The CSV is
+complete, the counters are satisfied.
+
+**Cause.** A fixed `max_new_tokens=512`. The model stops at 512 tokens with nothing to
+report it — it is not an error, it is the requested behaviour.
+
+```{python}
+budget = fonction("budget", PARAGRAPHES)
+print("paragraph of 3300 characters:")
+print(f"  tokens needed (~3.5 chars/token, +15 % in Croatian) : "
+      f"~{int(3300 / 3.5 * 1.15)}")
+print(f"  allowed by a fixed value of 512                     : 512  -> truncated")
+print(f"  allowed by budget()                                 : "
+      f"{budget(['x' * 3300])}")
+```
+
+**Fix.** Compute the ceiling per batch, from the longest segment.
+
+## 4. Padding on the wrong side
+
+**Symptom.** Batched generation on a decoder model: the outputs are grammatical but do
+not correspond to the inputs.
+
+**Cause.** With `padding_side="right"`, the last position of a short sequence is a
+padding token. The model therefore continues *from the padding*, not from the end of the
+prompt.
+
+```
+right padding:  [short prompt] [PAD] [PAD] <- the model continues here
+left padding :  [PAD] [PAD] [short prompt] <- the model continues here
+```
+
+**Fix.** `tok.padding_side = "left"`. And as a bonus this makes stripping the prompt
+trivial: every sequence in the batch has the same input length, so
+`gen[:, enc["input_ids"].shape[1]:]` is valid for the whole batch.
+
+## 5. The unmonitored out-of-memory
+
+**Symptom.** A run launched, left alone, found stopped two hours later.
+
+**Cause.** `batch_size=64` in bf16 on a note of 79 pieces. Within a batch, every
+sequence is padded to the length of the longest: a 1,200-character piece forces its 63
+neighbours up to that size.
+
+**Recurrence.** The same failure came back later, at `--batch 24` on a 45 GB card: the
+recursive re-splitting fired five times, then reached a batch of one element, where it
+re-raises by design. The process died at note 78 of 125. The additional lesson: a
+guardrail that bounds the damage does not replace correct sizing.
+
+**Fix, in two steps.** Sort the batch by length — which removes the cause — and re-split
+recursively on overflow — which bounds the consequence.
+
+**Methodological lesson, the most expensive in the project.** Do not launch a run of
+several hours without watching at least the first note.
+
+## 6. The redaction lost in translation
+
+**Symptom.** A Croatian note has one redaction fewer than its original. Nobody ever sees
+it.
+
+**Why it matters.** The opposite case is worse still: an *added* redaction manufactures
+missing data where the source had text. It happened on the first note translated by hand
+— `per AJ records` became `prema dokumentaciji ___`.
+
+**Fix.** Three quarters of "Protecting what must not be translated": integer markers,
+individual verification, and a per-note counter rather than silence.
+
+```{python}
+text, lost = restore("Bolesnica u 77701. godini, kateter od dr. 77703.", 3)
+print(f"markers lost: {lost}  ->  reported in the CSV's `markers_lost`")
+print("text:", text)
+```
+
+## 7. The counter that over-counts
+
+**Symptom.** Three notes of the HPLT corpus flagged for a redaction mismatch. Two are
+healthy.
+
+**Cause.** `str.count("___")` counts two occurrences in `______`, whereas
+`REDACTION = r"_{3,}"` sees — rightly — **one** redaction there, restored in its
+canonical form.
+
+```{python}
+series = "grade ______ Abdomen"
+p, n = protect(series)
+back, _ = restore(p, n)
+print(f"source  : count('___') = {series.count('___')}")
+print(f"restored: count('___') = {back.count('___')}  (n = {n} marker)")
+```
+
+**Why not fix the counter.** Because a counter that over-reacts flags three notes of
+which two are healthy: ten minutes of reading. A counter that under-reacts lets a real
+loss through: a corpus. **An imperfect check biased the right way beats an accurate check
+biased the wrong way.**
+
+## 8. The window that measures tokenisation
+
+**Symptom.** An F1 gap between English and Croatian, attributed to translation quality.
+
+**Cause.** At `MAX_SEQ_LENGTH = 8192`, Croatian loses 7,547 tokens to truncation against
+1,135 for English: a factor of 6.6. Croatian is less well represented in BPE
+vocabularies, so it consumes more tokens for the same content.
+
+**Fix.** A 16,384 window, where both corpora pass through whole. And count the truncated
+notes in `comparison.csv`, so that the question does not come up again.
+
+## 9. The model that emits no JSON
+
+**Symptom.** A model shows a precision of 1.000.
+
+**Cause.** One 31 B model failed to parse on 22 notes out of 40. Its precision covers 18
+answers. Without the `parse_failed` column, a format failure and a "No" answer are
+indistinguishable: both give `pred_catheter = False`.
+
+**Fix.** Three format metrics beside the F1 — `parse_failed`, `no_evidence`,
+`hallucinated_evidence` — and an immediate warning at the end of a run.
+
+**Effect on the conclusions.** The model ranking changes. This is what turned format
+quality into a first-class metric rather than a detail.
+
+## 10. The hallucination detector that accuses the good models
+
+**Symptom.** MedGemma 27B, which answers correctly 40 times out of 40, is flagged as
+hallucinating on most of the negative cases.
+
+**Cause.** The prompt **instructs** the model to write `no central venous device
+documented` when nothing is documented. That sentence is not in the note, so the
+detector counts it as invented. The more obedient the model, the more it is accused.
+
+**Fix.** `_ABSENCE_PHRASES`, the list of wordings the prompt authorises.
+
+**Lesson.** A checker has to know the rules given to the model, otherwise it measures
+obedience backwards.
+
+## 11. `ij` matches almost every Croatian word
+
+**Symptom.** The abbreviation `IJ` is detected everywhere in the Croatian corpus.
+
+```{python}
+sentence = "Bolesnik koji je primljen prije tri dane, nije imao kateter."
+print("substring 'ij':", len(re.findall("ij", sentence.lower())),
+      re.findall(r"\w*ij\w*", sentence.lower()))
+print("\\bIJ\\b, case-sensitive:", len(re.findall(r"\bIJ\b", sentence)))
+```
+
+**Fix.** Word boundaries, and case sensitivity for abbreviations — the word stems staying
+case-insensitive to cover declension.
+
+**Recurrence.** The same bug was reintroduced once, by an improvised command-line `grep`,
+after having been fixed in the tool. **A fix that lives in a tool does not protect the
+commands typed next to it.**
+
+## 12. `pgrep -f` matches itself
+
+**Symptom.** A wait loop meant to launch a job when another finishes never terminates.
+The GPU sits idle throughout.
+
+**Cause.** `pgrep -f "pattern"` finds its own command line, which contains the pattern.
+The condition "the process is still running" is therefore always true.
+
+**Made worse.** The corresponding `pkill` killed the shell that was running it — same
+reason, opposite effect.
+
+**Fix.** Get the PID explicitly (`ps -eo pid,cmd`), filter it, then act on that number.
+Never on a pattern.
+
+## 13. The "4-bit" repo that weighs twice as much
+
+**Symptom.** `Qwen3-32B-unsloth-bnb-4bit` takes up 39 GB. `Qwen3-32B-bnb-4bit`, 19 GB.
+Same model, same quantisation claim.
+
+**Cause.** The first repo contains the unquantised weights *in addition to* the quantised
+ones.
+
+**Fix.** Never infer the size from the name: sum the file sizes through the Hub API
+before downloading. It is the only reliable measurement, and it is free — one HTTP
+request instead of 39 GB.
+
+## 14. The call sized on the context window
+
+**Symptom.** A 10,000-character note sent in one piece comes back translated into
+impeccable English — but 40 % of the text is missing, always the end.
+
+**Cause.** The model's context window (131,072 tokens) says what it can **read**, not
+what it can **translate in one go**. That second figure is set by the length distribution
+of its training data: sentence pairs. Beyond that, the model emits its end token and
+**ignores the rest of the input**.
+
+**What made it invisible.** No exception. The number of tokens produced was even well
+under the allowed ceiling — 713 out of 1,985 — so nothing suggested a truncation.
+
+**Fix.** Split by paragraph, a measured unit that is stable in both languages. Detail in
+"The paragraph, a universal unit".
+
+**What it cost.** Two complete runs. The intermediate strategy of filling up to 3,000
+characters, which looked like a reasonable compromise, still lost 13 % of the redactions
+and cut short 14 % of the notes — and it was **2.5 times slower** than fine-grained
+splitting, because a batch generates until its longest sequence finishes.
+
+## 15. The model that copies instead of translating
+
+**Symptom.** Gemma 3 27B, on whole Croatian notes, returns outputs with length ratios of
+0.997 and 0.995. Apparently perfect.
+
+**Cause.** It was copying the Croatian. Out of 31 lines of content, 24 had stayed
+Croatian. On a short text, the same model with the same prompt translated correctly — it
+is the length that tipped it into "continue the pattern" mode.
+
+**What made it invisible.** The check in place was the **length ratio**. A copy has a
+ratio of 1.00: the metric could not, by construction, detect this case. That is the worst
+kind of indicator — the one that gives its best score on the most serious failure.
+
+**Fix.** A second check of nature rather than quantity: count the lines carrying marks of
+the source language against those carrying marks of the target language.
+
+**Lesson.** An indicator that cannot fail measures nothing. Before trusting a metric, you
+have to know which failure it is incapable of seeing.
+
+## What these fifteen cases have in common
+
+Three traits, which suggest three habits:
+
+**They produce a plausible output.** Fluent Croatian, valid JSON, a complete CSV. None of
+them looks like a breakdown. Hence the first habit: *check the invariant, not the absence
+of an error*. Count the redactions, count the parameters, count the parsing failures.
+
+**Several flattered the result.** The partly-English corpus improved the Croatian F1; the
+precision of 1.000 came from a sample shrunk by failures. Hence the second habit:
+*suspect the good news first*.
+
+**Four came from the verification tools themselves** — `_ABSENCE_PHRASES`, `\bport`, `ij`,
+and the length ratio of case 15. Hence the third: *a checker is code, with bugs of its
+own*. Re-read it against the real text, not against its intention.

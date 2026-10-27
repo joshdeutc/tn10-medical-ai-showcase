@@ -1,0 +1,413 @@
+---
+title: "Comment GMIC prépare vos mammographies"
+subtitle: "Guide visuel du prétraitement — de l'image brute au format d'inférence"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+jupyter: gmic
+---
+
+```{python}
+#| echo: false
+import os, glob, pickle, sys, re
+import cv2, numpy as np, pandas as pd
+import matplotlib.pyplot as plt, matplotlib.patches as mpatches
+from IPython.display import Markdown, display as ipy_display
+
+def _find_root(start):
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(cur, "scripts")) and os.path.isdir(os.path.join(cur, "GMIC")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return os.path.abspath(start)
+        cur = parent
+
+PROJECT_DIR = _find_root(os.getcwd())
+sys.path.insert(0, os.path.join(PROJECT_DIR, "GMIC"))
+
+GMIC_H, GMIC_W = 2944, 1920
+VIEWS      = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
+
+raw_param  = os.environ.get("GMIC_OUTPUT_DIR") or "data/preprocess_image/sample_docker"
+OUTPUT_DIR = raw_param if os.path.isabs(raw_param) else os.path.join(PROJECT_DIR, raw_param)
+
+CROPPED_DIR = os.path.join(OUTPUT_DIR, "cropped_images")
+PKL_BEFORE  = os.path.join(OUTPUT_DIR, "exam_list_before_cropping.pkl")
+PKL_CROP    = os.path.join(OUTPUT_DIR, "cropped_exam_list.pkl")
+PKL_FINAL   = os.path.join(OUTPUT_DIR, "data.pkl")
+SOURCE_FILE = os.path.join(OUTPUT_DIR, "source_dir.txt")
+SOURCE_DIR  = open(SOURCE_FILE).read().strip() if os.path.isfile(SOURCE_FILE) else None
+
+def load_u8(path):
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    f = img.astype(np.float32); m = f.max()
+    return (f / m * 255).astype(np.uint8) if m > 0 else np.zeros_like(f, dtype=np.uint8)
+
+def first_pid(exam):
+    return next((exam[v][0].split("/")[0] for v in VIEWS if exam.get(v)), "?")
+```
+
+## Pourquoi prétraiter ?
+
+Une mammographie brute ne peut pas être envoyée directement au modèle GMIC.
+Entraîné sur un corpus précis (INbreast / CBIS-DDSM), GMIC s'attend à recevoir des
+images dans un format très spécifique : taille fixe, fond noir supprimé, niveaux
+d'intensité normalisés.
+
+Quatre étapes transforment vos images brutes en ce format :
+
+| Étape | Ce qu'elle fait | Où |
+|---|---|---|
+| 1. Conversion DICOM → PNG | Extrait les pixels du format médical | `preprocess.py` |
+| 2. Construction du PKL | Organise les examens dans la structure GMIC | `preprocess.py` |
+| 3. Recadrage | Supprime le fond noir autour du sein | `preprocess.py` |
+| 4. Resize 2944×1920 | Uniformise la taille de toutes les images | `preprocess.py` |
+| — Flip + normalisation | Aligne les seins et centre la distribution | `inference.py` |
+
+> Le flip horizontal et la normalisation mean/std sont appliqués à la volée lors
+> de l'inférence — inutile de les précalculer ni de les stocker sur disque.
+
+Ce notebook illustre les 4 étapes de prétraitement sur vos images.
+
+---
+
+## Étape 1 — Conversion DICOM → PNG
+
+Les mammographies médicales sont souvent stockées au format **DICOM** (`.dcm`),
+un format qui encapsule bien plus que l'image : identité du patient, paramètres
+du scanner, métadonnées EXIF...
+
+Cette étape extrait les pixels bruts et les sauvegarde en **PNG 16-bit**.
+Elle corrige aussi une particularité de certains scanners qui stockent les niveaux
+inversés (**MONOCHROME1**) : sans correction, le tissu mammaire apparaîtrait en
+noir sur fond blanc — l'inverse de ce qu'attend GMIC.
+
+```python
+# preprocess.py · ligne 112
+if ds.PhotometricInterpretation == "MONOCHROME1":
+    arr = arr.max() - arr   # inverse les niveaux : blanc ↔ noir
+```
+
+> Si vos images sont déjà en PNG (comme les données `data/raw/sample/`), cette étape
+> est ignorée automatiquement.
+
+```{python}
+#| echo: false
+if not os.path.isfile(PKL_BEFORE):
+    print("exam_list_before_cropping.pkl absent — lancez d'abord : make preprocess INPUT_DIR=... OUTPUT_DIR=...")
+else:
+    with open(PKL_BEFORE, "rb") as f:
+        exams_before = pickle.load(f)
+
+    complete = [e for e in exams_before if all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    n_cancer = sum(1 for e in exams_before if e["cancer_label"]["malignant"])
+    n_imgs   = sum(len(e.get(v,[])) for e in exams_before for v in VIEWS)
+
+    summary = pd.DataFrame([
+        {"Métrique": "Examens chargés",              "Valeur": len(exams_before)},
+        {"Métrique": "Examens complets (4 vues)",    "Valeur": len(complete)},
+        {"Métrique": "dont cancer",                  "Valeur": n_cancer},
+        {"Métrique": "dont sains",                   "Valeur": len(exams_before) - n_cancer},
+        {"Métrique": "Images totales référencées",   "Valeur": n_imgs},
+    ])
+    ipy_display(summary.set_index("Métrique"))
+
+    incomplete = [(e, [v for v in VIEWS if not e.get(v)])
+                  for e in exams_before if not all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    if incomplete:
+        ipy_display(Markdown(f"\n**{len(incomplete)} examens incomplets (vues manquantes) :**\n"))
+        rows_inc = [{"Patient": first_pid(e), "Vues manquantes": ", ".join(m)}
+                    for e, m in incomplete[:15]]
+        ipy_display(pd.DataFrame(rows_inc))
+    else:
+        ipy_display(Markdown("*Tous les examens ont les 4 vues.*"))
+```
+
+### Aperçu des images avant traitement
+
+Les images ci-dessous sont les PNG tels qu'ils arrivent dans votre `INPUT_DIR`,
+avant tout traitement. On y voit les 4 vues standard d'une mammographie :
+**CC** (cranio-caudale, de dessus) et **MLO** (médio-latérale oblique, de côté),
+pour chaque sein (L = gauche, R = droite).
+
+```{python}
+#| echo: false
+if os.path.isfile(PKL_BEFORE) and SOURCE_DIR and os.path.isdir(SOURCE_DIR):
+    show = {}
+    for e in complete:
+        lbl = "Cancer" if e["cancer_label"]["malignant"] else "Sain"
+        if lbl not in show: show[lbl] = e
+        if len(show) == 2: break
+
+    for lbl, exam in show.items():
+        pid = first_pid(exam)
+        fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+        fig.suptitle(f"Patient {lbl} ({pid}) — Images PNG source", fontsize=11, fontweight="bold")
+        for ax, view in zip(axes, VIEWS):
+            imgs = exam.get(view, [])
+            if imgs:
+                iid = imgs[0].split("/")[1]
+                img = load_u8(os.path.join(SOURCE_DIR, pid, iid + ".png"))
+                if img is not None:
+                    ax.imshow(img, cmap="gray")
+                    ax.set_title(f"{view}\n{img.shape[1]}×{img.shape[0]} px", fontsize=9)
+                else:
+                    ax.text(0.5, 0.5, "Fichier absent", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "Vue absente", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9)
+            ax.axis("off")
+        plt.tight_layout(); plt.show()
+elif not SOURCE_DIR:
+    print("source_dir.txt absent — images sources non disponibles.")
+```
+
+---
+
+## Étape 2 — Construction du PKL GMIC
+
+GMIC n'accède pas aux fichiers image directement : il attend un fichier
+**`.pkl`** (Python pickle) qui décrit tous les examens dans une structure précise.
+
+Pour chaque patient, ce fichier liste :
+- les chemins vers les 4 images (une par vue),
+- le label cancer (`malignant : True/False`),
+- les métadonnées nécessaires aux étapes suivantes.
+
+Cette étape lit votre `train.csv` et construit ce fichier pickle.
+C'est la "colonne vertébrale" que toutes les étapes suivantes vont enrichir.
+
+```python
+# preprocess.py · lignes 150–154
+"cancer_label": {
+    "malignant":       0,   # ← 1 si le patient a un cancer (n'importe quel côté)
+    "left_malignant":  0,   # ← 1 si cancer côté gauche
+    "right_malignant": 0,   # ← 1 si cancer côté droit
+    ...
+}
+```
+
+> Ces labels sont lus depuis la colonne `cancer` de votre `train.csv` et propagés
+> par latéralité. L'inférence les réutilise pour calculer l'AUC-ROC.
+
+---
+
+## Étape 3 — Recadrage (`crop_mammogram`)
+
+Une mammographie brute contient beaucoup de **fond noir** autour du sein.
+Ce fond perturbe GMIC : entraîné sur des images recadrées, il obtient de moins
+bonnes performances si le fond noir est présent.
+
+`crop_mammogram` détecte automatiquement le tissu mammaire par seuillage et
+supprime les bords noirs. Il mémorise dans le PKL la `window_location` — les
+coordonnées exactes de la zone découpée dans l'image originale.
+
+```python
+# preprocess.py · lignes 210–215
+src/cropping/crop_mammogram.py
+    --input-data-folder  <png_dir>         # images PNG sources
+    --output-data-folder <cropped_dir>     # où écrire les PNG recadrés
+    --exam-list-path     <pkl_raw>         # PKL d'entrée (construit à l'étape 2)
+    --cropped-exam-list-path <pkl_crop>    # PKL de sortie (avec window_location)
+    --num-processes 4                      # parallélisation sur 4 cœurs
+```
+
+> `crop_mammogram` est le script GMIC original — on l'appelle en sous-processus
+> pour réutiliser exactement la même logique que les auteurs du papier.
+
+### Avant et après recadrage
+
+Le **rectangle jaune** sur l'image originale (ligne du haut) montre la zone que
+`crop_mammogram` a extraite. L'image recadrée (ligne du bas) est le résultat.
+
+```{python}
+#| echo: false
+if not os.path.isfile(PKL_CROP):
+    print("cropped_exam_list.pkl absent.")
+else:
+    with open(PKL_CROP, "rb") as f:
+        exams_crop = pickle.load(f)
+    n_png = len(glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True))
+
+if os.path.isfile(PKL_CROP) and os.path.isfile(PKL_BEFORE) and SOURCE_DIR and os.path.isdir(SOURCE_DIR):
+    show_crop = {}
+    crop_complete = [e for e in exams_crop if all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    for e in crop_complete:
+        lbl = "Cancer" if e["cancer_label"]["malignant"] else "Sain"
+        if lbl not in show_crop: show_crop[lbl] = e
+        if len(show_crop) == 2: break
+
+    for lbl, exam in show_crop.items():
+        pid = first_pid(exam)
+
+        fig, axes = plt.subplots(2, 4, figsize=(18, 11))
+        fig.suptitle(f"Patient {lbl} ({pid}) — Avant / Après recadrage",
+                     fontsize=11, fontweight="bold")
+
+        for col, view in enumerate(VIEWS):
+            imgs = exam.get(view, [])
+            sfp  = imgs[0] if imgs else None
+            iid  = sfp.split("/")[1] if sfp else None
+
+            ax_o = axes[0][col]
+            if iid and SOURCE_DIR:
+                img_o = load_u8(os.path.join(SOURCE_DIR, pid, iid + ".png"))
+            else:
+                img_o = None
+
+            if img_o is not None:
+                ax_o.imshow(img_o, cmap="gray")
+                H_o, W_o = img_o.shape[:2]
+
+                wl = (exam.get("window_location") or {}).get(view, [None])[0]
+                if wl and len(wl) == 4:
+                    # window_location = (y_top, y_bottom, x_left, x_right) — coins absolus
+                    y_top, y_bottom, x_left, x_right = (
+                        max(0, min(int(wl[0]), H_o)),
+                        max(0, min(int(wl[1]), H_o)),
+                        max(0, min(int(wl[2]), W_o)),
+                        max(0, min(int(wl[3]), W_o)),
+                    )
+                    rw = x_right - x_left
+                    rh = y_bottom - y_top
+                    if rw > 0 and rh > 0:
+                        ax_o.add_patch(mpatches.Rectangle(
+                            (x_left, y_top), rw, rh,
+                            linewidth=2, edgecolor="yellow", facecolor="none",
+                            label="Zone recadrée"
+                        ))
+                        ax_o.legend(fontsize=7, loc="lower right")
+
+                ax_o.set_title(f"{view} — Original\n{W_o}×{H_o} px", fontsize=9)
+            else:
+                ax_o.text(0.5, 0.5, "Image absente", ha="center", va="center",
+                          transform=ax_o.transAxes)
+            ax_o.axis("off")
+
+            ax_c = axes[1][col]
+            if sfp:
+                img_c = load_u8(os.path.join(CROPPED_DIR, sfp + ".png"))
+                if img_c is not None:
+                    ax_c.imshow(img_c, cmap="gray")
+                    ax_c.set_title(f"Recadrée\n{img_c.shape[1]}×{img_c.shape[0]} px", fontsize=9)
+                else:
+                    ax_c.text(0.5, 0.5, "Absent", ha="center", va="center",
+                              transform=ax_c.transAxes)
+            ax_c.axis("off")
+
+        axes[0][0].set_ylabel("Original", fontsize=11, labelpad=10)
+        axes[1][0].set_ylabel("Recadrée", fontsize=11, labelpad=10)
+        plt.tight_layout(); plt.show()
+elif not SOURCE_DIR:
+    print("source_dir.txt absent — comparaison avant/après impossible.")
+```
+
+---
+
+## Étape 4 — Resize 2944×1920 + normalisation
+
+Après recadrage, les images ont des **tailles variables** selon les scanners
+(certains produisent 3000×2500, d'autres 2000×1600...).
+
+GMIC a été entraîné sur des images de taille exactement **2944×1920 pixels**.
+Toutes les images sont donc redimensionnées à cette taille, puis normalisées
+en **uint8** (valeurs entières de 0 à 255).
+
+Ces deux contraintes — taille fixe et type uint8 — sont des prérequis stricts :
+un modèle PyTorch ne peut pas traiter un batch d'images de tailles différentes,
+et les poids ont été appris avec cette plage de valeurs.
+
+```python
+# preprocess.py · lignes 279–280
+interp = cv2.INTER_AREA if (h > GMIC_H or w > GMIC_W) else cv2.INTER_LINEAR
+img_resized = cv2.resize(img, (GMIC_W, GMIC_H), interpolation=interp)
+```
+
+> **Pourquoi deux interpolations ?** `INTER_AREA` (réduction) évite l'aliasing
+> quand on rétrécit — il moyenne les pixels voisins. `INTER_LINEAR` (agrandissement)
+> interpole en bilinéaire quand on agrandit — il est plus doux que le voisin le plus proche.
+
+```{python}
+#| echo: false
+pngs_all = glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True)
+sample   = pngs_all[:min(40, len(pngs_all))]
+bad_size, bad_dtype = [], []
+for p in sample:
+    img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+    if img is None: continue
+    h, w = img.shape[:2]
+    if h != GMIC_H or w != GMIC_W:
+        bad_size.append(os.path.relpath(p, OUTPUT_DIR))
+    if img.dtype != np.uint8:
+        bad_dtype.append(os.path.relpath(p, OUTPUT_DIR))
+
+if sample:
+    summary = pd.DataFrame([
+        {"Vérification": "Images vérifiées",              "Résultat": len(sample)},
+        {"Vérification": f"Taille ≠ {GMIC_W}×{GMIC_H}", "Résultat": len(bad_size) or "OK — toutes conformes"},
+        {"Vérification": "Type ≠ uint8",                  "Résultat": len(bad_dtype) or "OK — toutes conformes"},
+    ])
+    ipy_display(summary.set_index("Vérification"))
+else:
+    print("Aucune image PNG trouvée dans cropped_images/ — lancez d'abord make preprocess.")
+```
+
+---
+
+## Récapitulatif
+
+À l'issue des 4 étapes, chaque examen est représenté par :
+
+- **4 images PNG** de 2944×1920 px, normalisées en uint8, dans `cropped_images/`
+- **`data.pkl`** — copie de `cropped_exam_list.pkl`, prêt pour l'inférence
+
+À l'inférence (`make infer`), chaque image subit à la volée :
+1. **Flip horizontal** des vues droites (R-CC, R-MLO) — tous les seins regardent à gauche
+2. **Normalisation mean/std** — centre la distribution sur ~N(0,1) pour le modèle
+
+```{python}
+#| echo: false
+rows = []
+for step, pkl_path, label in [
+    ("1–2 Après conversion + PKL", PKL_BEFORE, "exam_list_before_cropping.pkl"),
+    ("3 Après recadrage",           PKL_CROP,   "cropped_exam_list.pkl"),
+    ("4 Après resize",              PKL_FINAL,  "data.pkl"),
+]:
+    if not os.path.isfile(pkl_path):
+        rows.append({"Étape": step, "Fichier": label, "Examens": "—", "Complets": "—", "Images": "—"})
+        continue
+    with open(pkl_path, "rb") as f:
+        exs = pickle.load(f)
+    rows.append({
+        "Étape":    step,
+        "Fichier":  label,
+        "Examens":  len(exs),
+        "Complets": sum(1 for e in exs if all(len(e.get(v,[])) > 0 for v in VIEWS)),
+        "Images":   sum(len(e.get(v,[])) for e in exs for v in VIEWS),
+    })
+
+n_png = len(glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True))
+rows.append({"Étape": "PNG sur disque", "Fichier": "cropped_images/",
+             "Examens": "—", "Complets": "—", "Images": n_png})
+
+ipy_display(pd.DataFrame(rows).set_index("Étape"))
+
+rel_src = os.path.relpath(SOURCE_DIR, PROJECT_DIR) if SOURCE_DIR else "<input_dir>"
+rel_out = os.path.relpath(OUTPUT_DIR, PROJECT_DIR)
+ipy_display(Markdown(f"""
+---
+
+Pour relancer ce prétraitement :
+
+~~~bash
+make preprocess INPUT_DIR={rel_src} OUTPUT_DIR={rel_out}
+make infer      OUTPUT_DIR={rel_out}
+~~~
+"""))
+```

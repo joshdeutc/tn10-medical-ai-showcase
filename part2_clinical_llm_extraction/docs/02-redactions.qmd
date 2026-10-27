@@ -1,0 +1,255 @@
+---
+title: "Protecting what must not be translated"
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+import sys
+sys.path.insert(0, ".")
+import glob
+import re
+import statistics
+import pandas as pd
+from _outils import *          # noqa: F403
+# Load the constants and then the functions into the same namespace, rather than
+# copying the values here: MARK and REDACTION stay defined in one single place.
+ns = {"re": re}
+for nom in ("MARK", "REDACTION", "protect", "restore", "sentences"):
+    exec(compile(source_de(nom, PARAGRAPHES), "<traduire_paragraphes>", "exec"), ns)
+protect, restore, sentences = ns["protect"], ns["restore"], ns["sentences"]
+```
+
+*Code covered: `protect`, `restore` and `sentences` in
+`tools/traduire_paragraphes.py`.*
+
+## What `___` is, and why it is the most fragile content
+
+MIMIC-IV-Note is de-identified: dates, names, ages, places and numbers have been
+replaced by a run of underscores.
+
+```{python}
+#| echo: false
+notes = pd.read_excel(RACINE / "CATH-LLM" / "exampleNotes_250.xlsx")[["id_note", "input"]]
+compte = notes.input.str.count("___")
+print(f"redactions per note: median {compte.median():.0f}, min {compte.min()}, "
+      f"max {compte.max()}")
+print(f"total over the 249 notes: {compte.sum()}")
+```
+
+They have to cross the translation **intact and in place**. Two reasons:
+
+1. comparing two languages assumes identical content. A lost redaction is a difference
+   in content, and therefore a confounding variable in the measurement;
+2. an *invented* redaction is worse: it manufactures missing data where the note had
+   text. It happened during the manual translation — `PAST MEDICAL HISTORY: per AJ
+   records` had become `prema dokumentaciji ___`.
+
+And a translation model has no reason whatsoever to respect a run of underscores. It
+may reformat it, merge two of them, move one, or drop one — and above all, **it does so
+without an error**. Nothing in the output signals the loss.
+
+::: {.callout-warning}
+## The trap that does not get discussed enough
+
+`___` does not always stand in for an identifier. Sometimes it stands in for **a
+connecting word** in the middle of a sentence: `from LAD ___ gastric Lymphoma`,
+`jaundice in the past ___ extrinsic compression`.
+
+The temptation, for a model as much as for a human translator, is to translate the
+*meaning* of the sentence and make the redaction disappear. On the contrary, one has to
+write `limfadenopatijom ___ limfom želuca`, even at the cost of an awkward sentence: the
+source is awkward too.
+:::
+
+This is the **only** concession `traduire_paragraphes.py` makes to the corpus format,
+and it can be switched off with `--no-protect`. On a text without redactions it does
+nothing anyway.
+
+## `protect`: turning a fragile pattern into a robust one {#sec-protect}
+
+```{python}
+#| echo: false
+#| output: asis
+montre("MARK", "REDACTION", "protect", ou=PARAGRAPHES)
+```
+
+Every redaction becomes a **unique integer**: 77701, 77702, 77703…
+
+The reasoning fits in one sentence: *a translation model copies numbers faithfully,
+because that is its job*. A date, a dosage, a laboratory result have to cross the
+translation unchanged — models are trained for that. A run of underscores is not: it is
+not language, and nothing protects it.
+
+```{python}
+extract = "The patient is a ___ year old woman. Catheter placed on ___ by Dr. ___."
+p, n = protect(extract)
+print("before :", extract)
+print("after  :", p)
+print("count  :", n)
+```
+
+Two details that matter:
+
+- **the numbering is increasing and unique**, via the `nonlocal n` closure. Identical
+  markers would make it impossible to check that none had been merged;
+- **the count `n` is returned along with the text.** That is what makes the later check
+  possible; without it, the source would have to be re-read.
+
+The choice of 77700 as the base is not arbitrary: it is a five-digit number that has no
+reason to appear in a discharge summary — laboratory values, blood pressures, doses and
+years all live below it. It makes the control pattern `777\d\d` safe.
+
+## `restore`: forgiving, and why that is the right trade-off
+
+```{python}
+#| echo: false
+#| output: asis
+montre("restore", ou=PARAGRAPHES)
+```
+
+The function puts back what comes back, counts what is missing, and converts any
+residual marker — a `777xx` left as-is would be read as a clinical value, which would be
+worse than giving it back.
+
+```{python}
+cases = [
+    ("77701 year old woman, catheter placed 77702 by Dr. 77703.", "everything came back"),
+    ("Woman in her 77701s, catheter placed by Dr. 77703.",        "77702 lost"),
+    ("77701 year old, catheter 77702, Dr. 77702.",                "77703 became a duplicate"),
+]
+for output, description in cases:
+    text, lost = restore(output, 3)
+    print(f"  {description:26s} -> {lost} lost | {text}")
+```
+
+::: {.callout-important}
+## Whether to reject or tolerate depends on the size of the unit
+
+An earlier version of this function rejected the output wholesale as soon as one marker
+was missing, and the caller then kept the untranslated source text. That was not a
+mistake: on a 90-character unit, replacing the translation with its source costs one
+sentence and makes the failure visible.
+
+The same trade-off becomes absurd as soon as the unit grows. On a paragraph — and *a
+fortiori* on a 10,000-character note — a single missing marker would throw away all the
+rest of the translation, which is good. Hence the opposite choice here: **restore what
+comes back and quantify the loss**, rather than cancelling everything.
+
+The general rule: the bigger the unit, the more wholesale rejection costs, and the more
+it has to be replaced by a measurement.
+:::
+
+The `markers_lost` counter carries exactly that risk, note by note:
+
+```{python}
+#| echo: false
+#| output: asis
+lignes = []
+for motif, nom in [("notes_retour_anglais.csv", "back HR -> EN"),
+                   ("notes_croate_paragraphes.csv", "out EN -> HR")]:
+    fs = glob.glob(str(RACINE / "results" / motif))
+    if not fs:
+        continue
+    d = pd.concat([pd.read_csv(f) for f in fs]).drop_duplicates("id_note")
+    lignes.append({"corpus": nom, "notes": f"{len(d)}/249",
+                   "source redactions": int(d.redactions_src.sum()),
+                   "markers lost": int(d.markers_lost.sum()),
+                   "rate": f"{d.markers_lost.sum() / max(1, d.redactions_src.sum()):.1%}"})
+tableau(lignes) if lignes else print("*(no corpus produced yet)*")
+```
+
+## The `str.count("___")` counter over-counts
+
+The simplest check is arithmetic: as many `___` on both sides. It fits on one line and
+catches the dangerous failure mode. But it has a bias that has to be known in order to
+read its signal.
+
+```{python}
+series = "Murmur [] grade ______ Abdomen: Soft"
+p, n = protect(series)
+back, _ = restore(p, n)
+print(f"source   : {series!r}")
+print(f"           count('___') = {series.count('___')}   (but one single redaction)")
+print(f"protected: {p!r}   -> n = {n}")
+print(f"restored : count('___') = {back.count('___')}")
+```
+
+`REDACTION = r"_{3,}"` treats a run of six underscores as **one** redaction, and gives
+it back in its canonical form `___`. But `str.count("___")` counted two of them in the
+source. The content is intact; it was the counter that was too generous.
+
+::: {.callout-note}
+## An imperfect check beats no check
+
+This could be fixed by counting `len(REDACTION.findall(t))`. That would be more
+accurate, and it would be a regression: the approximate count **over-reacts**, it flags
+healthy notes. A check that rings for nothing costs ten minutes of reading; a check
+that fails to ring when it should costs a corpus.
+
+What matters, then, is knowing how to read the signal: a gap of 1 or 2 on a note
+containing long runs is an artefact, a clear gap is a loss.
+:::
+
+## `sentences`: splitting a paragraph above the ceiling
+
+```{python}
+#| echo: false
+#| output: asis
+montre("sentences", ou=PARAGRAPHES)
+```
+
+96 % of paragraphs fit under 1,000 characters and therefore pass through whole. For the
+rest, the only acceptable boundary is the end of a sentence: **a truncated sentence
+yields a wrong translation, not merely an incomplete one.**
+
+```{python}
+text = ("Patient admitted with fever. Blood cultures were drawn from the line. "
+        "The catheter was removed on day three. She improved on vancomycin.")
+for i, m in enumerate(sentences(text, 80)):
+    print(f"  [{i}] {len(m):3d} chars  {m}")
+```
+
+`re.split(r"(?<=[.!?])\s+", text)` cuts *after* the punctuation: `(?<=…)` is a
+lookbehind, so the separator consumed is the space and the full stop stays attached to
+the sentence before it.
+
+### What the function cannot do
+
+```{python}
+no_punctuation = "___ 05:30AM BLOOD WBC-12.3* RBC-3.64* " * 40
+m = sentences(no_punctuation, 1000)
+print(f"{len(no_punctuation)} chars -> {len(m)} piece(s), "
+      f"longest {max(len(x) for x in m)} chars")
+```
+
+A block of laboratory values has no sentence-ending punctuation: the function cannot
+split it and returns it whole. That is not a defect but a limit worth knowing — it is
+for cases like this that `budget()` computes the generation ceiling per batch instead of
+fixing it once and for all.
+
+## The check before spending any GPU
+
+```{python}
+#| echo: false
+#| output: asis
+fichier(PARAGRAPHES, "    # Check the splitting before spending any GPU",
+        "    plan_vram(")
+```
+
+With no translation involved, splitting then re-joining has to preserve every redaction.
+The check costs two seconds and, were it to fail, would invalidate a run of several
+hours.
+
+## Takeaways
+
+- The `___` redactions are the most fragile content in the corpus and the most silently
+  lost; this whole chapter exists for them.
+- `protect` converts them into integers because a translator copies numbers faithfully —
+  it exploits a property of the model rather than working around it.
+- `restore` tolerates and **quantifies** instead of rejecting: on a unit the size of a
+  paragraph, wholesale rejection would throw away a correct translation over one marker.
+- The `count("___")` check over-counts long runs. Keeping it as-is is a choice: a false
+  alarm beats silence.
+- `sentences` never cuts in the middle of a sentence, and cannot split a text without
+  punctuation.

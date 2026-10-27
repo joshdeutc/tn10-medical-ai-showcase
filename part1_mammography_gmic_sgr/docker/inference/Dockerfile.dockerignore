@@ -1,0 +1,33 @@
+# .dockerignore spécifique à l'image d'inférence (BuildKit : <Dockerfile>.dockerignore).
+# Le Dockerfile fait des COPY sélectifs ; ce fichier sert surtout à garder le
+# contexte de build léger en excluant les données et caches non embarqués.
+
+.git/
+.venv/
+.claude/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Données lourdes NON embarquées (on ne garde que data/raw/sample)
+data/raw/cifar10/
+data/raw/extract_dataset3/
+data/raw/test_images/
+data/preprocess_image/
+
+# GMIC : samples lourds + dossiers parasites créés par un pip foireux (=0.2.2, ...)
+GMIC/sample_data/
+GMIC/sample_output/
+GMIC/=*
+GMIC/example_notebook.ipynb
+
+# Artefacts Quarto / docs lourds
+*.html
+*_files/
+
+# Secrets
+.env
+.env.code-server

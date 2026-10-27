@@ -1,0 +1,721 @@
+---
+title: "Abstention — Du score softmax au seuil garanti"
+subtitle: "Softmax Response (SR) et algorithme SGR par dichotomie"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+jupyter: gmic
+---
+
+```{python}
+#| echo: false
+import os
+import sys
+import json
+import pickle
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+
+warnings.filterwarnings("ignore")
+
+
+def _find_root(start: str) -> str:
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(cur, "abstention_module")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return os.path.abspath(start)
+        cur = parent
+
+
+PROJECT_DIR = _find_root(os.getcwd())
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+from abstention_module.math_utils import B_star, binom_sum
+from abstention_module.sgp_utils import sgp_dicho, emp_errs_count, emp_metric
+from abstention_module.preprocessing import train_test_split
+
+RUN_DIR = Path(PROJECT_DIR) / "abstention_module" / "runs" / \
+    "density" / "resnet18_pretrained-D" / "20260429-134215"
+
+run_ok = (RUN_DIR / "sgp_set.pkl").exists() and (RUN_DIR / "meta.json").exists()
+if run_ok:
+    sgp = pickle.load(open(RUN_DIR / "sgp_set.pkl", "rb"))
+    meta = json.loads((RUN_DIR / "meta.json").read_text())
+```
+
+# Partie I — Pourquoi s'abstenir
+
+## 1. Le problème : un classifieur qui se trompe parfois
+
+Un classifieur entraîné sur les mammographies RSNA atteint typiquement **~95 % d'accuracy**
+à coverage = 1 (il prédit sur **toutes** les images). Le reste — les 5 % d'erreurs —
+n'est pas réparti uniformément : la plupart des images sont prédites avec une grande
+confiance et bien classées, et un petit nombre concentre les erreurs.
+
+L'idée de l'**abstention** (ou *selective classification*) est de laisser le modèle
+**refuser de répondre** sur les images douteuses, pour ne renvoyer un diagnostic que
+quand on a une garantie sur la qualité de la prédiction.
+
+## 2. Le cadre formel
+
+On suit le cadre de **Geifman & El-Yaniv (2017)**, *Selective Classification for Deep
+Neural Networks* (NeurIPS). Un classifieur sélectif est une **paire** :
+
+$$
+(f, g) \quad \text{avec} \quad f : \mathcal{X} \to \mathcal{Y}, \quad g : \mathcal{X} \to \{0, 1\}
+$$
+
+- $f$ est le classifieur de base (le ResNet, par exemple) ;
+- $g$ est la **fonction de sélection** : $g(x) = 1$ on prédit, $g(x) = 0$ on s'abstient.
+
+Sur cette paire on définit deux quantités centrales :
+
+$$
+\text{coverage} = \phi(f, g) = \mathbb{E}[g(X)]
+\qquad\qquad
+\text{selective risk} = R(f, g) = \frac{\mathbb{E}[\ell(f(X), Y)\, g(X)]}{\mathbb{E}[g(X)]}
+$$
+
+Le **coverage** est la proportion d'images sur lesquelles on accepte de prédire.
+Le **selective risk** est le taux d'erreur **conditionnel** aux images acceptées.
+
+> Plus on s'abstient, plus le risque baisse — mais le coverage aussi. L'objectif de
+> SGR est de trouver le **meilleur compromis** avec une garantie probabiliste.
+
+---
+
+# Partie II — La fonction de confiance : Softmax Response (SR)
+
+## 3. Construire $g$ à partir d'un score de confiance
+
+En pratique on choisit une **fonction de confiance** $\kappa : \mathcal{X} \to \mathbb{R}$
+et un seuil $\theta$, puis on pose :
+
+$$
+g_\theta(x) = \mathbb{1}\{\kappa(x) \geq \theta\}
+$$
+
+Plus $\theta$ est grand, plus on est sélectif (coverage ↓, risque attendu ↓).
+
+## 4. Softmax Response
+
+Pour un réseau qui renvoie un vecteur de logits $z(x) \in \mathbb{R}^K$, la **softmax
+response** (SR) est simplement le maximum du vecteur softmax :
+
+$$
+\kappa_{\text{SR}}(x) = \max_{k} \, \text{softmax}(z(x))_k
+$$
+
+C'est la confiance que le réseau donne à sa propre prédiction. Geifman & El-Yaniv
+montrent que, malgré sa simplicité, SR est un excellent *ranker* — c'est-à-dire que
+trier les images par $\kappa_{\text{SR}}$ décroissant trie aussi (approximativement)
+des plus sûres vers les plus douteuses.
+
+```python
+# abstention_module/preprocessing.py — prepare_sgp_dico()
+softmax_values    = F.softmax(batch_preds / T, dim=1)
+softmax_responses = torch.max(softmax_values, dim=1)[0]   # = kappa SR
+_, predicted     = torch.max(batch_preds, 1)              # = y_pred
+```
+
+À la sortie de l'inférence on dispose d'un DataFrame `sgp_set` à trois colonnes :
+`y_true`, `y_pred`, `kappa`. Toute la suite (calibration du seuil, tracé des
+courbes) ne manipule plus que ce DataFrame.
+
+```{python}
+#| echo: false
+if run_ok:
+    print(f"Run : {RUN_DIR.name}")
+    print(f"Images dans le sgp_set : {len(sgp)}")
+    print(f"kappa ∈ [{sgp.kappa.min():.4f}, {sgp.kappa.max():.4f}]")
+    print(f"Accuracy à coverage = 1 : "
+          f"{(sgp.y_true == sgp.y_pred).mean()*100:.2f} %")
+```
+
+## 5. À quoi ressemble la courbe SR → accuracy ?
+
+Les deux courbes ci-dessous sont calculées à la volée à partir du `sgp_set` du run
+(le DataFrame `kappa`, `y_pred`, `y_true`). Pour chaque seuil $\theta$ on calcule
+l'accuracy sur les images acceptées et le coverage correspondant. C'est la même
+logique que [`abstention_module/threshold.py`](../../abstention_module/threshold.py),
+qui sauvegarde ce graphique sous `accuracy_vs_sr_threshold.png` dans le dossier
+du run.
+
+```{python}
+#| echo: false
+if run_ok:
+    thresholds = np.linspace(sgp.kappa.min(), sgp.kappa.max(), 60)
+    accs, covs = [], []
+    for t in thresholds:
+        sel = sgp.loc[sgp.kappa >= t]
+        covs.append(len(sel) / len(sgp))
+        accs.append((sel.y_true == sel.y_pred).mean() if len(sel) > 0 else np.nan)
+
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].plot(thresholds, accs, lw=2, color="steelblue")
+    ax[0].set_xlabel(r"seuil $\theta$ sur $\kappa_{SR}$")
+    ax[0].set_ylabel("accuracy (sélective)")
+    ax[0].set_title("Accuracy vs seuil")
+    ax[0].grid(alpha=0.3)
+
+    ax[1].plot(covs, accs, lw=2, color="seagreen")
+    ax[1].set_xlabel("coverage")
+    ax[1].set_ylabel("accuracy (sélective)")
+    ax[1].set_title("Risk-coverage curve")
+    ax[1].invert_xaxis()
+    ax[1].grid(alpha=0.3)
+
+    plt.tight_layout(); plt.show()
+```
+
+À gauche : quand on monte $\theta$, on garde les images les plus sûres, et l'accuracy
+sélective monte. À droite : la même information vue comme un compromis
+risque/couverture.
+
+> **Le problème** : cette courbe est **empirique**, mesurée *a posteriori* sur le
+> set de calibration. Rien ne garantit que le seuil $\theta$ choisi tiendra sur des
+> nouvelles données. C'est exactement ce que résout SGR.
+
+---
+
+# Partie III — SGR : choisir $\theta$ avec garantie probabiliste
+
+## 6. La question posée par SGR
+
+L'algorithme **SGR** (*Selection with Guaranteed Risk*, Geifman & El-Yaniv 2017,
+**Algorithm 1**) répond à la question suivante :
+
+> *Étant donné un risque cible $r^\star$ et un niveau de confiance $\delta$, trouver
+> le seuil $\theta^\star$ le plus petit possible (donc le coverage le plus grand
+> possible) tel que :*
+>
+> $$\Pr\big[\, R(f, g_{\theta^\star}) \leq r^\star \,\big] \geq 1 - \delta$$
+
+L'idée centrale : on ne peut pas calculer $R(f, g_\theta)$ exactement, mais on peut
+calculer une **borne supérieure $B^\star$** valable avec probabilité $\geq 1 - \delta$.
+On cherche alors le $\theta$ le plus petit tel que $B^\star \leq r^\star$.
+
+### Quelle est notre confiance ?
+
+Le paramètre $\delta$ est défini une fois pour toutes dans le module :
+
+```python
+# abstention_module/sgp_utils.py
+DELTA = 5e-3
+```
+
+Soit **$\delta = 0{,}005$**, ce qui correspond à un niveau de confiance
+$1 - \delta = 0{,}995$ — **99{,}5 %**. Autrement dit, sur 200 calibrations
+indépendantes du seuil $\theta^\star$ sur des sets de calibration différents, on
+s'attend à ce qu'**au plus une** voie le vrai risque dépasser la cible $r^\star$.
+
+C'est la même valeur que celle utilisée par Geifman & El-Yaniv dans leurs
+expériences. Elle peut être abaissée (par ex. $\delta = 10^{-3}$, confiance 99{,}9 %)
+au prix d'une borne $B^\star$ plus pessimiste — donc d'un $\theta^\star$ plus haut
+et d'un coverage plus faible.
+
+## 7. La borne $B^\star$ (inversion de la queue binomiale)
+
+Sur l'ensemble accepté de taille $n_\theta$ avec $e$ erreurs observées, le risque
+empirique est $\hat r = e / n_\theta$. La borne supérieure $B^\star$ est le plus
+grand taux d'erreur "vrai" $b$ compatible avec ces observations au niveau $\delta$ :
+
+$$
+B^\star(\delta, e, n_\theta) \;=\; \sup\Big\{ b \in [0, 1] \;:\; \sum_{j=0}^{e} \binom{n_\theta}{j} b^j (1-b)^{n_\theta - j} \;\geq\; \delta \Big\}
+$$
+
+On résout ça numériquement par dichotomie sur $b$ (`B_star` dans
+`abstention_module/math_utils.py`). Quelques cas limites :
+
+- $e = 0$ (aucune erreur observée) : $B^\star = 1 - \delta^{1/n_\theta}$
+- $e = n_\theta$ : $B^\star = 1$ (non-informatif, on ne peut rien dire)
+
+```python
+# abstention_module/math_utils.py — B_star
+def B_star(delta, e, n, b1=0, b2=1):
+    if (e == n) or (n == 0):    return 1
+    if e == 0:                  return 1 - delta ** (1 / n)
+    b = (b1 + b2) / 2
+    if abs(binom_sum(b, e, n) - delta) < eps:  return b
+    elif binom_sum(b, e, n) <= delta - eps:    return B_star(delta, e, n, b1, b)
+    else:                                      return B_star(delta, e, n, b, b2)
+```
+
+`binom_sum(b, e, n)` est la probabilité d'observer **au plus $e$ erreurs** sur $n$
+tirages Bernoulli($b$) i.i.d. Quand cette probabilité passe en dessous de $\delta$,
+on a trouvé une valeur de $b$ "trop grande" pour être plausible : la borne
+supérieure est juste avant.
+
+```{python}
+#| echo: false
+# Forme de B*(delta, e, n) selon e à n fixé — illustre l'écart borne / risque empirique
+n_fix, delta_plot = 500, 5e-3
+es = np.arange(0, 60, 2)
+bs = [B_star(delta_plot, int(e), n_fix) for e in es]
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(es, bs, marker="o", markersize=4, color="darkorange",
+        label=rf"$B^\star$ (n={n_fix}, $\delta$=5e-3)")
+ax.plot(es, es / n_fix, "--", color="gray", label=r"risque empirique $e/n$")
+ax.set_xlabel("nombre d'erreurs observées $e$")
+ax.set_ylabel("risque")
+ax.set_title(r"Borne $B^\star$ et risque empirique selon $e$")
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+```
+
+> La borne (orange) est toujours **au-dessus** du risque empirique (pointillé).
+> L'écart, c'est le "prix" de la garantie à 99{,}5 % : il décroît quand $n$ augmente.
+
+## 8. L'algorithme : recherche dichotomique sur $\theta$
+
+La borne $B^\star$ est **monotone décroissante** en $\theta$ : plus on est sélectif,
+plus le set accepté contient des images "sûres", moins il y a d'erreurs, plus la
+borne est petite. On peut donc faire une **recherche par dichotomie** sur $\theta$
+pour trouver le plus petit $\theta$ tel que $B^\star \leq r^\star$.
+
+L'algorithme (Algorithm 1 du papier) est essentiellement :
+
+```
+theta_min, theta_max = 0.5, 1
+pour k1 itérations :
+    theta  ← (theta_min + theta_max) / 2
+    n_theta, e_theta  ← compter sur le set accepté Sn[kappa ≥ theta]
+    b      ← B_star(delta / (2^k1 - 1),  e_theta,  n_theta)
+    si b < r*  →  theta_max = theta   # on peut se permettre d'être moins sélectif
+    sinon      →  theta_min = theta   # il faut être plus sélectif
+retourner theta
+```
+
+> **Pourquoi $\delta / (2^{k_1} - 1)$ et pas juste $\delta$ ?** Parce qu'on évalue
+> $B^\star$ à $k_1$ valeurs différentes de $\theta$. Pour qu'**aucune** des bornes
+> ne soit fausse avec probabilité $\geq 1 - \delta$, on applique une **union bound** :
+> chaque évaluation doit tenir au niveau $\delta / (2^{k_1} - 1)$.
+
+Le nombre d'itérations $k_1$ est choisi pour qu'avec une grille équivalente de taille
+$k_2$, on ait $2^{k_1} \geq k_2 + 1$ — c'est le minimum pour que la dichotomie soit
+au moins aussi précise que la version greedy. Dans le code :
+
+```python
+# abstention_module/sgp_utils.py — paramètres
+K2 = 50
+K1 = int(np.log(K2 + 1) / np.log(2)) + 1   # ⇒ K1 = 6
+DELTA = 5e-3
+```
+
+## 9. La fonction `sgp_dicho` annotée
+
+```python
+# abstention_module/sgp_utils.py — sgp_dicho (extrait)
+def sgp_dicho(delta, r_star, Sn, metric, theta_min=0.5, theta_max=1, k1=K1):
+    n = Sn.shape[0]
+    for _ in range(k1):
+        theta = (theta_min + theta_max) / 2
+        selected = Sn.loc[Sn.kappa >= theta]
+        e        = emp_errs_count(selected, loss=metric)
+        b        = B_star(delta / (2**k1 - 1), e, selected.shape[0])
+
+        if (selected.shape[0] == 0) or (e == selected.shape[0]):
+            b = 1                                      # cas dégénéré
+
+        if (b == 1) or (e == 0 and b >= r_star):
+            return {}                                  # cible inatteignable
+
+        if b < r_star:    theta_max = theta            # ↓ être moins sélectif
+        else:             theta_min = theta            # ↑ être plus sélectif
+
+    return {"theta_star": theta, "bound": b, "delta": delta,
+            "coverage": selected.shape[0] / n,
+            "emp_metric": emp_metric(selected, metric=metric)}
+```
+
+Deux cas où la fonction renvoie `{}` (échec) :
+
+- **`b == 1`** : la borne reste non-informative (set accepté vide ou que des erreurs)
+  → impossible de garantir quoi que ce soit.
+- **`e == 0 and b ≥ r_star`** : aucune erreur observée mais le set est trop petit
+  pour que la garantie probabiliste descende sous $r^\star$. Il faudrait plus de
+  données.
+
+---
+
+# Partie IV — Démo sur un run réel
+
+## 10. Les figures produites par le run
+
+Les deux figures suivantes sont générées par
+[`abstention_module/abstention_demo_SR.py`](../../abstention_module/abstention_demo_SR.py)
+et sauvegardées dans le dossier du run. Elles balayent l'algorithme SGR sur un
+ensemble de cibles $r^\star \in [0{,}025, \; 0{,}45]$, à confiance fixée
+$\delta = 5\cdot 10^{-3}$, avec la dichotomie comme moteur de recherche.
+
+```{python}
+#| echo: false
+fig_theta = RUN_DIR / "abstention_SR_vs_theta.png"
+fig_cov   = RUN_DIR / "abstention_SR_vs_coverage.png"
+
+if fig_theta.exists() and fig_cov.exists():
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    axes[0].imshow(mpimg.imread(str(fig_theta))); axes[0].axis("off")
+    axes[0].set_title("SR vs $\\theta$")
+    axes[1].imshow(mpimg.imread(str(fig_cov))); axes[1].axis("off")
+    axes[1].set_title("SR vs coverage")
+    plt.tight_layout(); plt.show()
+else:
+    print("Figures absentes — lance : python -m abstention_module.abstention_demo_SR")
+```
+
+Chaque point du nuage = une cible $r^\star$ pour laquelle la dichotomie a réussi à
+trouver un $\theta^\star$. On y lit : la **borne** $B^\star$ (par construction
+sous $r^\star$), le risque mesuré sur train et sur test (non vu pendant la
+calibration), et la couverture obtenue. La validité du test set — c'est ce qu'on
+attend : avec probabilité $\geq 99{,}5\,\%$ le risque test reste sous la cible.
+
+## 11. La même chose en tableau
+
+```{python}
+#| echo: false
+if run_ok:
+    train_set, test_set = train_test_split(sgp, seed=0)
+    theta_min_run = 0.5
+    theta_max_run = meta["kappa_max"]
+    targets = [0.10, 0.07, 0.05, 0.03, 0.02]
+
+    rows = []
+    for r_star in targets:
+        out = sgp_dicho(
+            delta=5e-3, r_star=r_star, Sn=train_set, metric="standard",
+            theta_min=theta_min_run, theta_max=theta_max_run,
+        )
+        if not out:
+            rows.append({"r*": r_star, "θ*": "—", "bound": "—",
+                         "cov. train": "—", "risk test": "—", "cov. test": "—"})
+            continue
+        sel_test = test_set.loc[test_set.kappa > out["theta_star"]]
+        risk_test = (sel_test.y_true != sel_test.y_pred).mean() if len(sel_test) > 0 else np.nan
+        rows.append({
+            "r*": f"{r_star:.3f}",
+            "θ*": f"{out['theta_star']:.4f}",
+            "bound": f"{out['bound']:.3f}",
+            "cov. train": f"{out['coverage']*100:.1f}%",
+            "risk test": f"{risk_test*100:.2f}%" if not np.isnan(risk_test) else "—",
+            "cov. test": f"{len(sel_test)/len(test_set)*100:.1f}%",
+        })
+
+    print("Calibration SGR (δ = 5e-3, dichotomie, métrique 0/1) :\n")
+    print(pd.DataFrame(rows).to_string(index=False))
+```
+
+Lecture du tableau :
+
+- **r\*** : cible de risque qu'on souhaite garantir.
+- **θ\*** : seuil renvoyé par la dichotomie sur le set de calibration.
+- **bound** : borne $B^\star$ obtenue — par construction $\leq r^\star$.
+- **cov. train / cov. test** : proportion d'images sur lesquelles on prédit.
+- **risk test** : risque empirique mesuré sur le set de test (jamais vu pendant la
+  calibration). Il devrait être $\leq r^\star$ avec probabilité $\geq 1 - \delta$.
+
+Plus on demande un risque garanti faible, plus $\theta^\star$ monte, plus la
+couverture chute : c'est le compromis fondamental de l'abstention.
+
+## 12. Comment l'utiliser à l'inférence
+
+Une fois $\theta^\star$ calibré :
+
+```python
+# À l'inférence sur une nouvelle image x :
+logits = model(x)
+kappa  = F.softmax(logits, dim=1).max().item()
+if kappa >= theta_star:
+    prediction = logits.argmax().item()       # on répond
+else:
+    prediction = None                         # on s'abstient
+```
+
+C'est tout. Le seuil $\theta^\star$ encapsule toute la garantie probabiliste.
+
+---
+
+# Partie V — La chaîne complète du code
+
+Jusqu'ici on a vu **l'algorithme**. Cette partie suit le **trajet d'un checkpoint
+jusqu'aux figures** dans le module `abstention_module/` — quel fichier fait quoi, et
+dans quel ordre les choses sont appelées.
+
+```
+runs_config.yaml ──┐
+                   ▼
+              infer.py      ─→  sgp_set.pkl + meta.json   (par checkpoint)
+                                   │
+                                   ▼
+                              algo1.py     ─→  sgp_<metric>_SR_vs_*.png
+                              (boucle sur 0/1 risk, FP risk, FN risk)
+                                   │ appelle
+                                   ▼
+                          sgp_at_targets(mode="dicho")
+                                   │ pour chaque r*
+                                   ▼
+                              sgp_dicho        ─→  θ*, bound, coverage
+                                   │ utilise
+                                   ▼
+                              B_star            ─→  borne probabiliste
+                                   │ utilise
+                                   ▼
+                              binom_sum         ─→  Σⱼ C(n,j) bʲ (1-b)ⁿ⁻ʲ
+```
+
+## 13. Le pipeline d'inférence — [`infer.py`](../../abstention_module/infer.py)
+
+Le point d'entrée n'est **pas un argparse complet** mais un fichier YAML :
+[`abstention_module/runs_config.yaml`](../../abstention_module/runs_config.yaml). Il
+liste simplement les chemins vers les checkpoints à évaluer, et tout le reste
+(architecture, nb de canaux, dataset, stats de normalisation) est **auto-détecté**
+depuis le `state_dict` et son `args.json` voisin :
+
+```yaml
+# runs_config.yaml
+checkpoints:
+  - path: fine_tuning/checkpoints/runs/density/resnet18_pretrained/20260429-134215/best.pt
+    positive_class: 3        # densité D (extrêmement dense), 1-vs-all
+```
+
+Pour chaque ligne du YAML, `infer.py` exécute :
+
+```python
+# abstention_module/infer.py — schéma
+arch          = _detect_arch(ckpt)                 # 'smallcnn' | 'resnet18'
+in_channels   = _detect_in_channels(ckpt)          # 1 (grayscale) | 3 (RGB)
+num_classes   = _detect_num_classes(ckpt)          # 1 (BCE) | 4 (CrossEntropy)
+dataset_kind  = _detect_dataset(ckpt)              # 'rsna' | 'rsna_density' | 'cifar'
+
+model  = _load_model(ckpt, device, arch, in_channels, num_classes)
+loader, df, info = _build_loader_<dataset_kind>(...)
+preds  = _run_inference(model, loader, device, positive_class)
+
+sgp = df[["image_id", "split"]].merge(preds, on="image_id")
+sgp.to_pickle(out_dir / "sgp_set.pkl")
+sgp.to_csv   (out_dir / "sgp_set.csv")
+meta_path.write_text(json.dumps(meta))             # diag, kappa_min/max, etc.
+```
+
+Le cœur — calcul de $\kappa_{\text{SR}}$ et $\hat y$ — tient dans
+[`_run_inference`](../../abstention_module/infer.py) :
+
+```python
+# abstention_module/infer.py — _run_inference (extrait)
+out = model(x)
+if out.shape[1] > 1:                                 # multi-classe (1-vs-all)
+    p = torch.softmax(out, dim=1)[:, positive_class]
+else:                                                # binaire
+    p = torch.sigmoid(out.squeeze(1))
+y_pred = (p >= 0.5).long()
+kappa  = torch.maximum(p, 1.0 - p)                   # = SR pour {0,1}
+```
+
+> **Subtilité** : pour un classifieur binaire la "softmax response" se réduit à
+> $\max(p, 1-p)$, ce qui est exactement ce que renvoie la ligne ci-dessus —
+> équivalent à `max(softmax([logit, 0]))` mais sans recalculer la softmax.
+
+Le `sgp_set.pkl` qui sort de tout ça est un DataFrame à 6 colonnes :
+
+| colonne | type | rôle |
+|---|---|---|
+| `image_id` | int | clé d'image (pour rejoindre avec d'autres tables) |
+| `split` | str | `"cal"` ou `"test"` — défini en amont, fige le découpage |
+| `y_true` | 0/1 | classe vraie |
+| `y_pred` | 0/1 | classe prédite (seuil 0,5 sur `p`) |
+| `p` | float | probabilité prédite pour la classe positive |
+| `kappa` | float | confiance SR = $\max(p, 1-p)$ |
+
+C'est **tout** ce que les algos SGR consomment. À partir de là, plus aucun appel au
+modèle ni au dataloader : tout se passe sur ce DataFrame.
+
+```{python}
+#| echo: false
+if run_ok:
+    print(f"Colonnes du sgp_set : {list(sgp.columns)}")
+    print(f"Splits : {dict(sgp['split'].value_counts())}")
+    print()
+    print(sgp.head(3).to_string(index=False))
+```
+
+## 14. Le runner — [`algo1.py`](../../abstention_module/algo1.py)
+
+Une fois le `sgp_set.pkl` produit, on appelle `algo1.py` qui boucle sur **trois
+métriques inconditionnelles** (chacune avec sa propre cible et son propre seed de
+split) et produit les figures du run.
+
+```python
+# abstention_module/algo1.py
+RUN_DIR  = Path("abstention_module/runs") / sys.argv[1]
+meta     = json.loads((RUN_DIR / "meta.json").read_text())
+theta_SR = (0.5, meta["kappa_max"])             # plage de θ pour la dichotomie
+MODE     = "dicho"                              # Algo 1 = dichotomie
+
+BLOCKS = [
+    ("0/1 risk", "standard", np.linspace(0.03, 0.20, 50), 0, "<", "standard"),
+    ("FP risk",  "FP",       np.linspace(0.03, 0.16, 50), 1, "<", "FP"),
+    ("FN risk",  "FN",       np.linspace(0.001, 0.04, 50), 2, "<", "FN"),
+]
+
+sgp_SR = pickle.load(open(RUN_DIR / "sgp_set.pkl", "rb"))
+
+for label, metric, targets, seed, direction, slug in BLOCKS:
+    train, test = train_test_split(sgp_SR, seed=seed)
+    res = sgp_at_targets(                       # ← le cœur SGR
+        train, test, metric_targets=targets, metric=metric, mode=MODE,
+        theta_min=theta_SR[0], theta_max=theta_SR[1],
+    )
+    sgp_metric_block(res, label, slug, RUN_DIR, theta_SR, theta_MCD,
+                     direction=direction)        # ← écrit les .png
+```
+
+Deux idées clés :
+
+- **Une figure par métrique**, jamais de panel mélangeant 0/1 risk, FP risk et FN
+  risk — l'axe vertical n'est pas comparable d'une métrique à l'autre.
+- **Un seed différent par bloc** : on ne veut pas que la même partition train/test
+  serve les trois métriques (sinon les courbes deviennent corrélées de manière
+  artificielle).
+
+À l'intérieur de [`sgp_at_targets`](../../abstention_module/sgp_utils.py), pour chaque
+cible $r^\star$ on appelle simplement `sgp_dicho`, on récupère le $\theta^\star$, on
+mesure la métrique sur le set de test, et on accumule les lignes :
+
+```python
+# abstention_module/sgp_utils.py — sgp_at_targets (extrait)
+for r_star in metric_targets:
+    out = sgp_dicho(delta, r_star, train_set, metric, theta_min, theta_max)
+    if out == {}:  continue                              # cible inatteignable
+    sel_test = test_set.loc[test_set.kappa > out["theta_star"]]
+    results.append({
+        "metric_target": r_star, "metric_bound": out["bound"],
+        "theta_star":    out["theta_star"],
+        "train_metric":  out["emp_metric"], "train_coverage": out["coverage"],
+        "test_metric":   emp_metric(sel_test, metric=metric),
+        "test_coverage": sel_test.shape[0] / test_set.shape[0],
+    })
+return pd.DataFrame(results)
+```
+
+C'est cette `pd.DataFrame` qui alimente le tableau du §11 et les nuages de points
+sauvegardés du §10.
+
+## 15. Le cœur arithmétique — `binom_sum` et `B_star`
+
+Tout l'édifice probabiliste repose sur **un seul calcul** : la somme binomiale
+tronquée. Étant donnés $n$ tirages Bernoulli($b$) indépendants, c'est la probabilité
+d'observer **au plus $e$** succès :
+
+$$
+\text{binom\_sum}(b, e, n) \;=\; \sum_{j=0}^{e} \binom{n}{j} b^j (1-b)^{n-j}
+\;=\; \Pr\big[\,\text{Bin}(n, b) \leq e\,\big]
+$$
+
+```python
+# abstention_module/math_utils.py — binom_sum (forme stable en log)
+def binom_sum(b, e, n):
+    # somme des log-probas via gammaln pour éviter les overflows binomiaux
+    if e < n:
+        v = np.array([
+            np.exp(binomial_log(n, j) + j*np.log(b) + (n-j)*np.log(1-b))
+            for j in range(e + 1)
+        ])
+        return np.sum(v)
+    elif e == n:  return 1
+```
+
+`B_star` est ensuite **l'inverse fonctionnelle** : on cherche le plus grand $b$ tel
+que la probabilité d'observer "au plus $e$ erreurs" reste $\geq \delta$. C'est une
+**dichotomie sur $b \in [0, 1]$** :
+
+```python
+# abstention_module/math_utils.py — B_star (dichotomie récursive)
+def B_star(delta, e, n, b1=0, b2=1):
+    eps = min(delta / 10, 1e-5)
+
+    if (e == n) or (n == 0):  return 1                        # non-informatif
+    if e == 0:                return 1 - delta ** (1/n)        # formule fermée
+
+    b = (b1 + b2) / 2
+    if abs(binom_sum(b, e, n) - delta) < eps:  return b        # ε-proche → stop
+    elif binom_sum(b, e, n) <= delta - eps:    return B_star(delta, e, n, b1, b)
+    else:                                      return B_star(delta, e, n, b, b2)
+```
+
+> **Deux dichotomies différentes, à ne pas confondre :**
+>
+> - `B_star` dichotomise sur **$b$** (l'erreur "vraie" hypothétique) à $\delta$, $e$,
+>   $n$ fixés — c'est de la résolution numérique d'équation.
+> - `sgp_dicho` dichotomise sur **$\theta$** (le seuil sur la confiance) à $\delta$,
+>   $r^\star$, $S_n$ fixés — c'est l'algorithme SGR au sens du papier.
+>
+> Et `sgp_dicho` appelle `B_star` à chacune de ses itérations.
+
+Le cas particulier $e = 0$ (aucune erreur observée) a une **forme fermée** :
+$B^\star = 1 - \delta^{1/n}$. C'est ce qui borne le risque "par le haut" même quand
+le risque empirique est nul — sinon $\hat r = 0$ donnerait à tort une garantie
+parfaite, alors qu'on n'a pas observé assez d'exemples pour le savoir.
+
+```{python}
+#| echo: false
+# Comparaison binom_sum à différents b — la fonction est strictement décroissante
+b_grid = np.linspace(0.001, 0.30, 80)
+e_obs, n_obs = 5, 200
+probs = [binom_sum(b, e_obs, n_obs) for b in b_grid]
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.plot(b_grid, probs, lw=2, color="steelblue")
+ax.axhline(5e-3, color="crimson", ls="--", label=r"$\delta = 5\cdot 10^{-3}$")
+b_solution = B_star(5e-3, e_obs, n_obs)
+ax.axvline(b_solution, color="darkgreen", ls=":",
+           label=rf"$B^\star = {b_solution:.3f}$")
+ax.set_xlabel(r"$b$ (erreur vraie hypothétique)")
+ax.set_ylabel(rf"$\Pr[\,\mathrm{{Bin}}({n_obs}, b) \leq {e_obs}\,]$")
+ax.set_title(rf"binom_sum$(b, e={e_obs}, n={n_obs})$ et la racine $B^\star$")
+ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+```
+
+Le point où la courbe **bleue** croise le pointillé **rouge** est exactement le
+$B^\star$ renvoyé par la dichotomie : la plus grande valeur de $b$ "encore
+plausible" au niveau $\delta$.
+
+---
+
+# Références
+
+1. **Geifman, Y. & El-Yaniv, R.** (2017). *Selective Classification for Deep Neural
+   Networks*. NeurIPS.
+   [arXiv:1705.08500](https://arxiv.org/abs/1705.08500) — papier de référence pour
+   SR (§4) et SGR (Algorithm 1, §5).
+
+2. **El-Yaniv, R. & Wiener, Y.** (2010). *On the foundations of noise-free selective
+   classification*. JMLR 11. — Cadre théorique original (notions de coverage et
+   selective risk).
+
+---
+
+# Annexes : fichiers du module
+
+| Fichier | Rôle | Section |
+|---|---|---|
+| [`abstention_module/runs_config.yaml`](../../abstention_module/runs_config.yaml) | Liste des checkpoints à évaluer | §13 |
+| [`abstention_module/infer.py`](../../abstention_module/infer.py) | Pipeline d'inférence : checkpoint → `sgp_set.pkl` + `meta.json` | §13 |
+| [`abstention_module/preprocessing.py`](../../abstention_module/preprocessing.py) | Helpers `train_test_split`, `prepare_sgp_dico` | §4 |
+| [`abstention_module/math_utils.py`](../../abstention_module/math_utils.py) | `B_star`, `binom_sum` — le cœur probabiliste | §7, §15 |
+| [`abstention_module/sgp_utils.py`](../../abstention_module/sgp_utils.py) | `sgp_dicho`, `sgp_at_targets`, `emp_metric` — algorithme SGR | §9, §14 |
+| [`abstention_module/algo1.py`](../../abstention_module/algo1.py) | Runner : boucle sur 0/1 risk / FP risk / FN risk → figures | §14 |
+| [`abstention_module/plotting.py`](../../abstention_module/plotting.py) | `sgp_metric_block`, `metric_plots` — les figures sauvegardées | §10, §14 |
+| [`abstention_module/threshold.py`](../../abstention_module/threshold.py) | Courbe `accuracy_vs_sr_threshold.png` (reproduction du papier) | §5 |

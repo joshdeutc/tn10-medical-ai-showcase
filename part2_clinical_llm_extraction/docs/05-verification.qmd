@@ -1,0 +1,283 @@
+---
+title: "Judging the model's output"
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+import sys
+sys.path.insert(0, ".")
+import pandas as pd
+from _outils import *          # noqa: F403
+NB = NB_EXTRACTION
+```
+
+*Code covered: the metrics and `verify.csv` sections of `tools/extraire.py`.*
+
+## The problem: eleven CSV files nobody reads
+
+Every model writes its own results file — eleven files of forty rows each, with the
+quotation, the reference label, the prediction, the duration. All the information is
+there, and it is unusable: to find *where* a model went wrong you have to open eleven
+files and cross two boolean columns by hand.
+
+`verify.csv` answers one precise demand: **a single file, only the cases that go wrong,
+readable as-is in a spreadsheet.**
+
+```{python}
+#| echo: false
+#| output: asis
+montre("VERIFY_COLS", ou=NB)
+```
+
+Six columns, in the order they are read: *which* problem, for *which model*, on *which*
+note, what was expected, what the model produced, and what the note actually says. The
+full count — including the correct answers — stays in `comparison.csv`; the two files
+do not overlap.
+
+## Four verdicts, and an order of severity
+
+```{python}
+#| echo: false
+#| output: asis
+montre("_verdict", "_SEVERITY", ou=NB)
+```
+
+The order of the tests in `_verdict` is an order of priority, and it is not arbitrary:
+
+| verdict | meaning | why that rank |
+|---|---|---|
+| `hallucination` | quotation absent from the note | the model invented clinical text: the most serious, whatever the label |
+| `parse_failed` | no usable JSON | the model is unusable in production, even if it "thinks" correctly |
+| `no_evidence` | valid JSON, empty `evidence` | an unverifiable answer |
+| `wrong_class` | wrong label, but a genuine quotation | an error of judgement, the least worrying |
+
+The ranking may be surprising: a classification error is **less** serious than an
+invented quotation. That is deliberate. A label error is visible, counted in the F1,
+and fixable by a human who re-reads the quotation. An invented quotation destroys the
+verifiability of *all* that model's answers, including the correct ones.
+
+```{python}
+#| echo: false
+#| output: asis
+v = pd.read_csv(RACINE / "results" / "verify.csv")
+piv = v.groupby(["model", "verdict"]).size().unstack(fill_value=0)
+for c in ["hallucination", "parse_failed", "no_evidence", "wrong_class"]:
+    if c not in piv:
+        piv[c] = 0
+piv = piv[["hallucination", "parse_failed", "no_evidence", "wrong_class"]]
+piv = piv.sort_values(["hallucination", "parse_failed"], ascending=False)
+tableau([{"model": i[:40], **{k: int(piv.loc[i, k]) for k in piv.columns}}
+         for i in piv.index])
+print(f"\n{len(v)} rows in total in verify.csv")
+```
+
+Two immediate readings: MedGemma 4B invents 27 quotations over 40 notes — it is
+disqualified whatever its F1. Gemma 4 31B fails to parse 22 times, which makes its
+precision of 1.000 meaningless.
+
+## `evidence_is_grounded`: the test that needed three fixes
+
+```{python}
+#| echo: false
+#| output: asis
+montre("evidence_is_grounded", ou=NB)
+```
+
+The idea is simple — is the quotation found in the note? — and its first version
+produced a lot of false positives. Three fixes were needed, each one found by
+re-reading the real text behind an accusation of hallucination.
+
+### Fix 1: the loose comparison
+
+```{python}
+#| echo: false
+#| output: asis
+montre("_normalise", ou=NB)
+```
+
+A MIMIC note wraps its lines at 80 columns, often mid-sentence. The model, for its
+part, quotes the whole sentence on one line. Without normalising whitespace and case, a
+character-exact quotation is declared missing.
+
+```{python}
+import re
+ns_nb = {"re": re}                       # load only what is needed
+for nom in ("_normalise", "_ABSENCE_PHRASES", "evidence_is_grounded"):
+    exec(compile(source_de(nom, NB), "<extraire.py>", "exec"), ns_nb)
+grounded, normalise = ns_nb["evidence_is_grounded"], ns_nb["_normalise"]
+
+note = ("Major Surgical or Invasive Procedure:\nR IJ placement\n\n"
+        "Brief Hospital Course: The patient was noted to have a right\ninternal "
+        "jugular catheter placed on admission.")
+citation = "a right internal jugular catheter placed on admission"
+print("quotation present character for character:", citation in note)
+print("after normalisation                     :", normalise(citation) in normalise(note))
+print("evidence_is_grounded                    :", grounded(citation, note))
+```
+
+### Fix 2: the absence wordings
+
+```{python}
+#| echo: false
+#| output: asis
+montre("_ABSENCE_PHRASES", ou=NB)
+```
+
+The prompt **instructs** the model to write `no central venous device documented` when
+nothing is documented. That is not a quotation, so looking for it in the note makes no
+sense. Without this exemption, **any model that follows the instruction to the letter
+is counted as hallucinating on every negative case** — that is, on most of the corpus.
+
+```{python}
+print("without the exemption, the obedient model would be accused:",
+      "no central venous device documented" not in note)
+print("with the exemption:", grounded("no central venous device documented", note))
+```
+
+This is the costliest kind of false positive: it accuses precisely the good models.
+
+### Fix 3: composite quotations
+
+Models readily concatenate several authentic passages, separated by `...`, `;` or a
+line break. Searched for in one piece, such a quotation is not found — even though
+every fragment of it is exact.
+
+```{python}
+composite = "R IJ placement ... a right internal jugular catheter placed on admission"
+print("in one piece :", normalise(composite) in normalise(note))
+print("by fragments :", grounded(composite, note))
+```
+
+The split runs on `\.\.\.|[;\n]|\s\|\s|(?<=\.)\s+`, fragments shorter than 15
+characters are ignored, and the threshold chosen is **half the fragments**:
+
+```python
+return sum(grounded) >= max(1, len(grounded) // 2)
+```
+
+Tolerate a rephrased linking sentence, without letting through a mostly invented
+montage. The threshold is a judgement call, not a truth — and it is better written
+down in one single place.
+
+::: {.callout-warning}
+## A hallucination detector has blind spots of its own
+
+A fourth fix belongs elsewhere, in a comparison tool that has since been retired, and
+it is worth recording: a pattern written `\bport(a|u|om)?\b` does not match
+`portacath`, because the word boundary falls in the middle of the term.
+
+The practical consequence: after announcing "2 notes out of 13 undetectable", a second
+reading showed there was only one — the second was a blind spot of my own tool, not a
+translation loss. **A verification tool has to be verified like everything else.**
+:::
+
+## `_note_context`: showing the right window
+
+```{python}
+#| echo: false
+#| output: asis
+montre("_DEVICE_HINT", "_note_context", ou=NB)
+```
+
+To settle a case you need to see the note — but not all 20,000 characters of it. The
+function looks, in order, for:
+
+1. **the area containing the quotation**, when there is one: the immediate context
+   allows a judgement at a glance;
+2. **the first mention of a device**, when the quotation cannot be found. That is
+   exactly the hallucination case, and it is where the choice matters: showing the
+   first 400 characters of the note would show only the administrative header — name,
+   dates, ward — which teaches nothing;
+3. **an explicit message** if the note mentions no device at all, which is information
+   in itself: the model invented everything.
+
+The framing `flat[pos - width // 3 : pos + …]` puts the point of interest at the first
+third rather than the middle: the sentence *following* a device mention is generally
+more informative than the one preceding it.
+
+## `save_verify`: accumulating without overwriting
+
+```{python}
+#| echo: false
+#| output: asis
+montre("save_verify", ou=NB)
+```
+
+Three formatting decisions that make the file usable:
+
+- **a single "expected vs obtained" column** (`mismatch`) instead of two booleans to
+  cross mentally: `missed a CVC`, `invented a CVC`, or `-` when the classification is
+  right despite another problem;
+
+```{python}
+#| echo: false
+#| output: asis
+tableau([{"mismatch": k, "rows": int(n)} for k, n in v.mismatch.value_counts().items()])
+```
+
+- **a single text column** (`model_output`): the raw output if parsing failed, the
+  quotation otherwise. The two never coexist, so two columns would each be half empty;
+- **replacement per model**:
+
+```python
+prev = prev[prev["model"] != label.split("/")[-1]]    # replaces the re-run model
+```
+
+Re-running a model replaces its rows instead of duplicating them. Without this, a model
+re-run after a fix would appear twice, carrying its old failures.
+
+The final sort applies `_SEVERITY`: hallucinations at the top, to be read first.
+
+## `verify_summary`: where the "ok" come from
+
+```{python}
+#| echo: false
+#| output: asis
+montre("verify_summary", ou=NB)
+```
+
+`verify.csv` only holds the problems; the number of correct answers therefore cannot be
+read from it. It is **derived**: the note total (read from `comparison.csv`) minus the
+sum of the problems. A join between two files, rather than a redundancy to keep
+consistent.
+
+## Reading the file: the case that exposed a reference error {#sec-goldstandard}
+
+The file served beyond its purpose: it called the labelling itself into question.
+
+Sorting on `wrong_class` for MedGemma 27B — the model that answers correctly 40 times
+out of 40 on the small corpus — one note stands out where the model codes `Yes` with a
+genuine quotation describing a catheter insertion, while the gold standard codes `N`.
+Checked: **the quotation matches word for word the wording that rule 4 of the prompt
+gives as a positive example**, and the human reference annotation does code `Y`.
+
+The reference label is wrong, not the model's answer.
+
+```{python}
+#| echo: false
+#| output: asis
+d = pd.read_csv(RACINE / "results" / "comparison.csv")
+gros = d[d.n == 249][["model", "f1", "precision", "recall", "tp", "fp", "fn", "tn"]]
+tableau([{"campaign": r.model, "F1": r.f1, "P": r.precision, "R": r.recall,
+          "TP": int(r.tp), "FP": int(r.fp), "FN": int(r.fn), "TN": int(r.tn)}
+         for r in gros.itertuples()])
+```
+
+A methodological consequence: in the 249-note campaign, some of the false positives
+counted against the model are gold-standard errors. The reported F1 is therefore a
+**floor**. Since the gold standard is produced by a model (Kimi K3) rather than by a
+clinician, that caveat has to travel with every figure — and `verify.csv` is what makes
+it possible to state it instead of assuming it.
+
+## Takeaways
+
+- A file containing only the problems gets read; eleven complete files do not.
+- The order of severity puts hallucination ahead of a label error: the first destroys
+  the verifiability of everything else.
+- `evidence_is_grounded` needed three fixes, all found by re-reading the text behind an
+  accusation. The most important one — exempting the absence wordings — was accusing
+  precisely the obedient models.
+- A verification tool has blind spots of its own and has to be verified.
+- The file ended up calling the reference labelling into question, which was not its
+  purpose but is its best use.

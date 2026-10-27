@@ -1,0 +1,262 @@
+---
+title: "Extraction, under a VRAM ceiling"
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+import sys
+sys.path.insert(0, ".")
+import pandas as pd
+from _outils import *          # noqa: F403
+NB = NB_EXTRACTION
+```
+
+*Code covered: `tools/extraire.py`.*
+
+## The prompt, and what it tries to prevent
+
+The system prompt is 6,400 characters long, in five sections. Its length is not
+verbosity: every paragraph answers a failure mode that was actually observed.
+
+| section | role |
+|---|---|
+| `# ROLE` | sets the trade-off: "asserting something the text does not support is worse than saying it is absent" |
+| `# NOTE FORMAT` | `___` means MISSING, never content; and where to look in the note |
+| `# WHAT COUNTS AS A CVC` | definition by device property, then two explicit lists |
+| `# DECISION RULES` | seven rules, including negation handling and the tie-break when ambiguous |
+| `# OUTPUT` | strict JSON schema, verbatim quotation required |
+
+The heart of the problem is rule 3:
+
+> READ THE DEVICE, NOT THE WORD. The string "catheter" / "catheterization" frequently
+> refers to the WRONG device (urinary catheter, cardiac catheterization, ureteral
+> stent). Conversely, genuine CVCs are often named WITHOUT that string — "IJ", "PICC",
+> "port", "Vas-Cath", "central line".
+
+In other words: the task is not a keyword search, and that is precisely why a language
+model is needed. A `grep catheter` would produce both false positives (urinary
+catheter, coronary angiogram) and false negatives (`R IJ placement`).
+
+The expected output fits in three fields:
+
+```{python}
+#| echo: false
+#| output: asis
+montre("build_user_prompt", ou=NB)
+```
+
+The `evidence` field is the most useful thing in the chain. It has no effect on the
+classification score, but it makes the answer **checkable**: a quotation has to be
+found word for word in the note. The next chapter turns that into an automatic test.
+
+::: {.callout-note}
+The prompt lists the devices **in English**. On a Croatian corpus, two variables
+therefore move together: the language of the note and how well the prompt fits it. The
+translation glossary limits the problem by keeping the abbreviations `PICC`, `IJ` and
+`CVK`, which are genuine Croatian hospital usage — but the caveat has to travel with
+every figure.
+:::
+
+## The token budget
+
+The context window splits three ways, and the note only gets what is left:
+
+```
+|<---------------------- MAX_SEQ_LENGTH ---------------------->|
+| fixed prompt (system + template) | note | MAX_NEW_TOKENS     |
+|         ~1,556 tokens            |  ?   |     512 tokens     |
+```
+
+```{python}
+#| echo: false
+#| output: asis
+montre("compute_remaining_token_budget", "truncate_text_to_token_budget", ou=NB)
+```
+
+The fixed prompt is measured by calling `apply_chat_template` on a message whose note
+is **empty**: that is the only way to get the real cost of the template, which varies
+from one model to the next (role tags, special tokens, preamble).
+
+Truncation is explicit and **counted**:
+
+```{python}
+#| echo: false
+#| output: asis
+fichier(NB, "    note_budget = MAX_SEQ_LENGTH - fixed_tokens", "    fail = {")
+```
+
+`n_truncated` travels all the way into `comparison.csv`, column `truncated_notes`.
+Without that counter, a model penalised by truncation would look like a model that
+reads badly.
+
+### Why 16,384 and not 8,192 {#sec-fenetre}
+
+This is the heaviest protocol decision in the project, and it is arithmetic.
+
+```{python}
+#| echo: false
+#| output: asis
+docstring(EXTRAIRE)
+```
+
+At 8,192 tokens the Croatian note would lose 7,547 tokens to truncation against 1,135
+for the English one — a factor of 6.6. Croatian consumes more tokens than English for
+the same content (a language thinly represented in BPE vocabularies), so **the window
+mechanically penalises the translation**. The F1 gap measured would have quantified
+that tokenisation asymmetry, not translation quality.
+
+At 16,384 both corpora pass through whole: at most 6,596 tokens in English, 7,677 in
+Croatian. The "truncation" variable is eliminated; only the language is left.
+
+## The defensive layer, and why it exists
+
+A good part of this code does no extraction at all: it absorbs incompatibilities
+between model families. Three of them each justify a function.
+
+### 1. Processor or Tokenizer?
+
+```{python}
+#| echo: false
+#| output: asis
+montre("_tok", "_to_inputs", ou=NB)
+```
+
+Multimodal models (MedGemma, Gemma 3) return a `Processor` — an object wrapping a text
+tokenizer and an image processor. It has neither `eos_token_id` nor `decode`, and
+`apply_chat_template` can make it return a **formatted string** instead of tensors.
+
+`getattr(tokenizer, "tokenizer", tokenizer)` covers both cases in one expression: if
+the attribute exists we take it, otherwise the object already is the right one.
+
+### 2. Three output shapes for the same call
+
+```{python}
+#| echo: false
+#| output: asis
+montre("count_template_tokens", ou=NB)
+```
+
+`apply_chat_template` may return a list of ids, a nested list `[[ids]]`, or a string.
+Counting tokens requires normalising all three — and a wrong count does not crash: it
+shifts the budget, and therefore truncates the note silently.
+
+### 3. Two template features that are not universal
+
+```{python}
+#| echo: false
+#| output: asis
+montre("_apply_template", "_build_inputs", ou=NB)
+```
+
+Two cascading fallbacks: `enable_thinking` (Qwen3) does not exist everywhere, and some
+templates refuse the `system` role, which then has to be merged into the `user` turn.
+
+The fallback is triggered by the **content of the error message** (`if "system" in
+str(e).lower()`). Fragile by nature, but it is the only signal available: the library
+raises generic exceptions.
+
+## Generation, and cleaning up the output
+
+```{python}
+#| echo: false
+#| output: asis
+fichier(NB, "    # \"Thinking\" models (Qwen3)", "    parsed.setdefault")
+```
+
+Three successive clean-ups, each for a real behaviour:
+
+1. **`<think>…</think>`** — reasoning models emit a thinking block before their
+   answer;
+2. **an unclosed `<think>`** — if the model exhausts its 512 tokens *inside* its
+   reasoning, the tag stays open. Without this second clean-up the whole text would
+   survive the first `re.sub` untouched, and the JSON would be looked for inside the
+   reasoning;
+3. **`re.search(r"\{.*\}", …)`** — extract the JSON object even when surrounded by
+   prose or code fences, despite the "JSON and nothing else" instruction.
+
+Every failure is **typed**, not swallowed: `no_json`, `bad_json`, `oom`, or the
+exception's name. That column is what separates, in the results, a model that always
+answers "No" from a model that answers nothing at all — both give
+`pred_catheter = False`.
+
+```{python}
+#| echo: false
+d = pd.read_csv(RACINE / "results" / "comparison.csv")
+```
+
+That distinction is not cosmetic, and it is why three counters — `parse_failed`,
+`no_evidence`, `hallucinated_evidence` — travel all the way into `comparison.csv`
+beside the F1. A model whose answers mostly fail to parse can post an excellent
+precision on the handful that survive; ranked on F1 alone it would sit level with a
+model that answers correctly every single time. **Format quality is a first-class
+metric, not an implementation detail.** The per-model breakdown belongs to the
+verification chapter, which reads `verify.csv`.
+
+## Fitting in VRAM: simulate before loading
+
+Loading a 70 B model only to discover it does not fit costs ten minutes of downloading
+and a crash. Two items decide: the weights, which we measure, and the KV cache, which
+we compute.
+
+### The KV cache formula
+
+```
+KV cache = 2 (K and V) × layers × kv_heads × head_dim × length × 2 bytes
+```
+
+```{python}
+#| echo: false
+#| output: asis
+montre("estimate_kv_cache_gb", ou=NB)
+```
+
+Three traps in that formula, all documented in the code:
+
+- **`num_key_value_heads`, not `num_attention_heads`.** Grouped-query attention (GQA)
+  shares the K and V projections across several query heads. On Llama-3.3-70B that
+  number is 8 against 64 attention heads: eight times less cache than the model size
+  would suggest;
+- **the cache stays in bf16 even with 4-bit weights.** Quantisation applies to the
+  weights, not to the cached activations. A "lightened" model therefore keeps a
+  full-size cache;
+- **`text_config`** for multimodal models: MedGemma's root config describes the whole
+  vision + text assembly, and its attention fields are not the decoder's.
+
+### Real measurements
+
+```{python}
+#| echo: false
+#| output: asis
+mes = d[d.weights_gb.notna()][["model", "n", "weights_gb", "kv_cache_gb",
+                               "peak_vram_gb", "vram_budget_gb", "fits_budget"]]
+mes = mes.assign(model=mes.model.str.replace("unsloth/", "", regex=False))
+tableau([{"model": r.model[:34], "notes": r.n, "weights": r.weights_gb,
+          "KV cache": r.kv_cache_gb, "measured peak": r.peak_vram_gb,
+          "budget": int(r.vram_budget_gb), "fits": "yes" if r.fits_budget else "NO"}
+         for r in mes.itertuples()])
+```
+
+The last two rows are the 249-note campaign, at `MAX_SEQ_LENGTH = 16384`: the KV cache
+weighs 8.3 GB there, close to half the footprint of the weights. Doubling the window
+doubles that item — it is the only real lever when a model sits right at the limit.
+
+`fits_budget` is not computed from the estimate but from the **measured peak**
+(`torch.cuda.max_memory_allocated`), which includes the activations. That is what
+decides: Llama-3.3-70B is announced at 39.5 GB of weights and measured at a 44.8 GB
+peak, so it does not fit in 40 GB.
+
+## Takeaways
+
+- The prompt is long because the task is lexically treacherous: the word "catheter"
+  most often refers to something else, and genuine CVCs are frequently named without
+  it.
+- The `evidence` field is not there to classify but to **verify**, which makes it the
+  most useful piece of the output.
+- The 16,384-token window is not comfort: at 8,192 the F1 gap would have measured a
+  tokenisation asymmetry between languages.
+- Half the loading code absorbs incompatibilities between model families; every
+  fallback matches a real model that was failing.
+- The KV cache is computed on `num_key_value_heads` and stays in bf16: it is the item
+  people forget, and the only one that grows with the window.
+- What decides feasibility is the measured peak, not the estimate.
